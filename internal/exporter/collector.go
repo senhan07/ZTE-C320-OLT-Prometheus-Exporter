@@ -121,6 +121,9 @@ func (c *OnuCollector) Start(ctx context.Context) {
 
 // collect performs a single run of the data collection.
 func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, ponMax int) {
+	log.Info().Msg("Starting metric collection run")
+	startTime := time.Now()
+
 	// Reset gauges to remove old data to avoid reporting stale metrics.
 	OnuMappingInfoGauge.Reset()
 	OnuStatusGauge.Reset()
@@ -132,6 +135,7 @@ func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, 
 	OnuLastOfflineGauge.Reset()
 	OnuGponOpticalDistanceGauge.Reset()
 
+	totalOnusProcessed := 0
 	for boardID := boardMin; boardID <= boardMax; boardID++ {
 		for ponID := ponMin; ponID <= ponMax; ponID++ {
 			// Discover active ONUs on the current board and PON.
@@ -145,6 +149,8 @@ func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, 
 				continue // No ONUs found, move to the next PON.
 			}
 
+			log.Debug().Int("board", boardID).Int("pon", ponID).Int("count", len(discoveredOnus)).Msg("Discovered ONUs")
+
 			// Fetch detailed information for each discovered ONU.
 			for _, discoveredOnu := range discoveredOnus {
 				onuID := discoveredOnu.ID
@@ -153,6 +159,8 @@ func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, 
 					log.Warn().Err(err).Int("board", boardID).Int("pon", ponID).Int("onu_id", onuID).Msg("Failed to get detailed ONU info")
 					continue // Move to the next ONU.
 				}
+
+				totalOnusProcessed++
 
 				// --- Update Prometheus Metrics ---
 
@@ -184,9 +192,10 @@ func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, 
 						// Filter out invalid readings
 						if rxPower < 100 {
 							OnuRxPowerGauge.With(labels).Set(rxPower)
+							log.Debug().Str("serial_number", detailedOnu.SerialNumber).Float64("rx_power", rxPower).Msg("Successfully parsed and set RxPower")
 						}
 					} else {
-						log.Warn().Err(err).Msg("Could not parse RxPower")
+						log.Warn().Err(err).Str("serial_number", detailedOnu.SerialNumber).Str("rx_power_str", detailedOnu.RXPower).Msg("Could not parse RxPower")
 					}
 
 					// Set ONU Tx Power Gauge
@@ -196,7 +205,7 @@ func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, 
 							OnuTxPowerGauge.With(labels).Set(txPower)
 						}
 					} else {
-						log.Warn().Err(err).Msg("Could not parse TxPower")
+						log.Warn().Err(err).Str("serial_number", detailedOnu.SerialNumber).Str("tx_power_str", detailedOnu.TXPower).Msg("Could not parse TxPower")
 					}
 				}
 
@@ -213,4 +222,6 @@ func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, 
 			}
 		}
 	}
+	duration := time.Since(startTime)
+	log.Info().Int("processed_onus", totalOnusProcessed).Str("duration", duration.String()).Msg("Finished metric collection run")
 }
