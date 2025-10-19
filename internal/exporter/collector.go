@@ -2,8 +2,8 @@ package exporter
 
 import (
 	"context"
-	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -20,12 +20,32 @@ type OnuCollector struct {
 // --- Helper functions for parsing ---
 
 // parseDurationStringToSeconds converts a duration string like "X days Y hours Z minutes W seconds" to total seconds.
+// It uses regular expressions to robustly parse the string.
 func parseDurationStringToSeconds(durationStr string) float64 {
-	var days, hours, minutes, seconds int
-	// Note: This parsing is basic and assumes a fixed format.
-	// A more robust solution would use regular expressions.
-	_, _ = fmt.Sscanf(durationStr, "%d days %d hours %d minutes %d seconds", &days, &hours, &minutes, &seconds)
-	totalSeconds := (days * 24 * 3600) + (hours * 3600) + (minutes * 60) + seconds
+	var totalSeconds int64
+
+	// Regular expressions for each time unit
+	daysRegex := regexp.MustCompile(`(\d+)\s*days`)
+	hoursRegex := regexp.MustCompile(`(\d+)\s*hours`)
+	minutesRegex := regexp.MustCompile(`(\d+)\s*minutes`)
+	secondsRegex := regexp.MustCompile(`(\d+)\s*seconds`)
+
+	// Helper function to parse and add time from a regex match
+	parseAndAddTime := func(regex *regexp.Regexp, multiplier int64) {
+		if matches := regex.FindStringSubmatch(durationStr); len(matches) > 1 {
+			value, err := strconv.ParseInt(matches[1], 10, 64)
+			if err == nil {
+				totalSeconds += value * multiplier
+			}
+		}
+	}
+
+	// Extract and sum all parts of the duration string
+	parseAndAddTime(daysRegex, 24*3600)
+	parseAndAddTime(hoursRegex, 3600)
+	parseAndAddTime(minutesRegex, 60)
+	parseAndAddTime(secondsRegex, 1)
+
 	return float64(totalSeconds)
 }
 
@@ -38,6 +58,22 @@ func parseTimestampStringToEpoch(timestampStr string) float64 {
 		return 0
 	}
 	return float64(t.Unix())
+}
+
+// mapStatusToNumeric maps the ONU status string to a numeric value.
+func mapStatusToNumeric(status string) float64 {
+	switch status {
+	case "Online":
+		return 1
+	case "Dying Gasp":
+		return 2
+	case "LOS":
+		return 3
+	case "Power-Off":
+		return 4
+	default:
+		return 0
+	}
 }
 
 // NewOnuCollector creates a new OnuCollector.
@@ -86,7 +122,8 @@ func (c *OnuCollector) Start(ctx context.Context) {
 // collect performs a single run of the data collection.
 func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, ponMax int) {
 	// Reset gauges to remove old data to avoid reporting stale metrics.
-	OnuInfoGauge.Reset()
+	OnuMappingInfoGauge.Reset()
+	OnuStatusGauge.Reset()
 	OnuRxPowerGauge.Reset()
 	OnuTxPowerGauge.Reset()
 	OnuUptimeGauge.Reset()
@@ -120,13 +157,11 @@ func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, 
 				// --- Update Prometheus Metrics ---
 
 				labels := prometheus.Labels{
-					"board":  strconv.Itoa(detailedOnu.Board),
-					"pon":    strconv.Itoa(detailedOnu.PON),
-					"onu_id": strconv.Itoa(detailedOnu.ID),
+					"serial_number": detailedOnu.SerialNumber,
 				}
 
-				// Set ONU Info Gauge
-				infoLabels := prometheus.Labels{
+				// Set ONU Mapping Info Gauge
+				mappingLabels := prometheus.Labels{
 					"board":          strconv.Itoa(detailedOnu.Board),
 					"pon":            strconv.Itoa(detailedOnu.PON),
 					"onu_id":         strconv.Itoa(detailedOnu.ID),
@@ -134,11 +169,13 @@ func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, 
 					"serial_number":  detailedOnu.SerialNumber,
 					"onu_type":       detailedOnu.OnuType,
 					"description":    detailedOnu.Description,
-					"ip_address":     detailedOnu.IPAddress,
 					"offline_reason": detailedOnu.LastOfflineReason,
-					"status":         detailedOnu.Status,
+					"ip_address":     detailedOnu.IPAddress,
 				}
-				OnuInfoGauge.With(infoLabels).Set(1)
+				OnuMappingInfoGauge.With(mappingLabels).Set(1)
+
+				// Set ONU Status Gauge
+				OnuStatusGauge.With(labels).Set(mapStatusToNumeric(detailedOnu.Status))
 
 				// Only report power metrics if the device is Online.
 				if detailedOnu.Status == "Online" {
