@@ -5,6 +5,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/megadata-dev/go-snmp-olt-zte-c320/internal/usecase"
@@ -12,77 +13,17 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// OnuCollector is a struct that holds the use case for fetching ONU data.
+// OnuCollector implements the prometheus.Collector interface.
 type OnuCollector struct {
 	onuUsecase usecase.OnuUseCaseInterface
+	boardMin   int
+	boardMax   int
+	ponMin     int
+	ponMax     int
 }
 
-// --- Helper functions for parsing ---
-
-// parseDurationStringToSeconds converts a duration string like "X days Y hours Z minutes W seconds" to total seconds.
-// It uses regular expressions to robustly parse the string.
-func parseDurationStringToSeconds(durationStr string) float64 {
-	var totalSeconds int64
-
-	// Regular expressions for each time unit
-	daysRegex := regexp.MustCompile(`(\d+)\s*days`)
-	hoursRegex := regexp.MustCompile(`(\d+)\s*hours`)
-	minutesRegex := regexp.MustCompile(`(\d+)\s*minutes`)
-	secondsRegex := regexp.MustCompile(`(\d+)\s*seconds`)
-
-	// Helper function to parse and add time from a regex match
-	parseAndAddTime := func(regex *regexp.Regexp, multiplier int64) {
-		if matches := regex.FindStringSubmatch(durationStr); len(matches) > 1 {
-			value, err := strconv.ParseInt(matches[1], 10, 64)
-			if err == nil {
-				totalSeconds += value * multiplier
-			}
-		}
-	}
-
-	// Extract and sum all parts of the duration string
-	parseAndAddTime(daysRegex, 24*3600)
-	parseAndAddTime(hoursRegex, 3600)
-	parseAndAddTime(minutesRegex, 60)
-	parseAndAddTime(secondsRegex, 1)
-
-	return float64(totalSeconds)
-}
-
-// parseTimestampStringToEpoch converts a timestamp string (YYYY-MM-DD HH:MM:SS) to a Unix epoch.
-func parseTimestampStringToEpoch(timestampStr string) float64 {
-	layout := "2006-01-02 15:04:05"
-	t, err := time.Parse(layout, timestampStr)
-	if err != nil {
-		log.Warn().Err(err).Str("timestamp", timestampStr).Msg("Could not parse timestamp string")
-		return 0
-	}
-	return float64(t.Unix())
-}
-
-// mapStatusToNumeric maps the ONU status string to a numeric value.
-func mapStatusToNumeric(status string) float64 {
-	switch status {
-	case "Online":
-		return 1
-	case "Dying Gasp":
-		return 2
-	case "LOS":
-		return 3
-	case "Power-Off":
-		return 4
-	default:
-		return 0
-	}
-}
-
-// NewOnuCollector creates a new OnuCollector.
+// NewOnuCollector creates a new OnuCollector and configures the scan range.
 func NewOnuCollector(onuUsecase usecase.OnuUseCaseInterface) *OnuCollector {
-	return &OnuCollector{onuUsecase: onuUsecase}
-}
-
-// Start runs the collector in a loop to periodically fetch data.
-func (c *OnuCollector) Start(ctx context.Context) {
 	// Get scan range from environment variables or use defaults.
 	boardMin, _ := strconv.Atoi(os.Getenv("PROMETHEUS_BOARD_MIN"))
 	boardMax, _ := strconv.Atoi(os.Getenv("PROMETHEUS_BOARD_MAX"))
@@ -103,41 +44,39 @@ func (c *OnuCollector) Start(ctx context.Context) {
 		ponMax = 16
 	}
 
-	// Run the collection loop.
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				log.Info().Msg("Starting ONU discovery and data collection for Prometheus")
-				c.collect(ctx, boardMin, boardMax, ponMin, ponMax)
-				log.Info().Msg("Finished ONU data collection")
-				time.Sleep(30 * time.Second) // Collection interval
-			}
-		}
-	}()
+	return &OnuCollector{
+		onuUsecase: onuUsecase,
+		boardMin:   boardMin,
+		boardMax:   boardMax,
+		ponMin:     ponMin,
+		ponMax:     ponMax,
+	}
 }
 
-// collect performs a single run of the data collection.
-func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, ponMax int) {
-	log.Info().Msg("Starting metric collection run")
+// Describe sends the static descriptions of all metrics collected by the exporter.
+func (c *OnuCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- OnuStatusGaugeDesc
+	ch <- OnuMappingInfoGaugeDesc
+	ch <- OnuRxPowerGaugeDesc
+	ch <- OnuTxPowerGaugeDesc
+	ch <- OnuUptimeGaugeDesc
+	ch <- OnuLastDownDurationGaugeDesc
+	ch <- OnuLastOnlineGaugeDesc
+	ch <- OnuLastOfflineGaugeDesc
+	ch <- OnuGponOpticalDistanceGaugeDesc
+}
+
+// Collect fetches the metrics from the OLT and delivers them to Prometheus.
+func (c *OnuCollector) Collect(ch chan<- prometheus.Metric) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // Scrape timeout
+	defer cancel()
+
+	log.Info().Msg("Starting metric collection for Prometheus scrape")
 	startTime := time.Now()
 
-	// Reset gauges to remove old data to avoid reporting stale metrics.
-	OnuMappingInfoGauge.Reset()
-	OnuStatusGauge.Reset()
-	OnuRxPowerGauge.Reset()
-	OnuTxPowerGauge.Reset()
-	OnuUptimeGauge.Reset()
-	OnuLastDownDurationGauge.Reset()
-	OnuLastOnlineGauge.Reset()
-	OnuLastOfflineGauge.Reset()
-	OnuGponOpticalDistanceGauge.Reset()
-
 	totalOnusProcessed := 0
-	for boardID := boardMin; boardID <= boardMax; boardID++ {
-		for ponID := ponMin; ponID <= ponMax; ponID++ {
+	for boardID := c.boardMin; boardID <= c.boardMax; boardID++ {
+		for ponID := c.ponMin; ponID <= c.ponMax; ponID++ {
 			// Discover active ONUs on the current board and PON.
 			discoveredOnus, err := c.onuUsecase.GetByBoardIDAndPonID(ctx, boardID, ponID)
 			if err != nil {
@@ -162,66 +101,123 @@ func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, 
 
 				totalOnusProcessed++
 
-				// --- Update Prometheus Metrics ---
+				// --- Create and send Prometheus Metrics ---
 
-				labels := prometheus.Labels{
-					"serial_number": detailedOnu.SerialNumber,
-				}
+				// Set ONU Mapping Info
+				ch <- prometheus.MustNewConstMetric(
+					OnuMappingInfoGaugeDesc,
+					prometheus.GaugeValue,
+					1,
+					strconv.Itoa(detailedOnu.Board),
+					strconv.Itoa(detailedOnu.PON),
+					strconv.Itoa(detailedOnu.ID),
+					detailedOnu.Name,
+					detailedOnu.SerialNumber,
+					detailedOnu.OnuType,
+					detailedOnu.Description,
+					detailedOnu.LastOfflineReason,
+					detailedOnu.IPAddress,
+				)
 
-				// Set ONU Mapping Info Gauge
-				mappingLabels := prometheus.Labels{
-					"board":          strconv.Itoa(detailedOnu.Board),
-					"pon":            strconv.Itoa(detailedOnu.PON),
-					"onu_id":         strconv.Itoa(detailedOnu.ID),
-					"name":           detailedOnu.Name,
-					"serial_number":  detailedOnu.SerialNumber,
-					"onu_type":       detailedOnu.OnuType,
-					"description":    detailedOnu.Description,
-					"offline_reason": detailedOnu.LastOfflineReason,
-					"ip_address":     detailedOnu.IPAddress,
-				}
-				OnuMappingInfoGauge.With(mappingLabels).Set(1)
+				// Set ONU Status
+				ch <- prometheus.MustNewConstMetric(
+					OnuStatusGaugeDesc,
+					prometheus.GaugeValue,
+					mapStatusToNumeric(detailedOnu.Status),
+					detailedOnu.SerialNumber,
+				)
 
-				// Set ONU Status Gauge
-				OnuStatusGauge.With(labels).Set(mapStatusToNumeric(detailedOnu.Status))
-
-				// Only report power metrics if the device is Online.
+				// Set power metrics only if the device is Online.
 				if detailedOnu.Status == "Online" {
-					// Set ONU Rx Power Gauge
 					if rxPower, err := strconv.ParseFloat(detailedOnu.RXPower, 64); err == nil {
-						// Filter out invalid readings
-						if rxPower < 100 {
-							OnuRxPowerGauge.With(labels).Set(rxPower)
+						if rxPower < 100 { // Filter out invalid readings
+							ch <- prometheus.MustNewConstMetric(OnuRxPowerGaugeDesc, prometheus.GaugeValue, rxPower, detailedOnu.SerialNumber)
 							log.Debug().Str("serial_number", detailedOnu.SerialNumber).Float64("rx_power", rxPower).Msg("Successfully parsed and set RxPower")
 						}
 					} else {
 						log.Warn().Err(err).Str("serial_number", detailedOnu.SerialNumber).Str("rx_power_str", detailedOnu.RXPower).Msg("Could not parse RxPower")
 					}
 
-					// Set ONU Tx Power Gauge
 					if txPower, err := strconv.ParseFloat(detailedOnu.TXPower, 64); err == nil {
-						// Filter out invalid readings
-						if txPower < 100 {
-							OnuTxPowerGauge.With(labels).Set(txPower)
+						if txPower < 100 { // Filter out invalid readings
+							ch <- prometheus.MustNewConstMetric(OnuTxPowerGaugeDesc, prometheus.GaugeValue, txPower, detailedOnu.SerialNumber)
 						}
 					} else {
 						log.Warn().Err(err).Str("serial_number", detailedOnu.SerialNumber).Str("tx_power_str", detailedOnu.TXPower).Msg("Could not parse TxPower")
 					}
 				}
 
-				// Set other gauges
-				OnuUptimeGauge.With(labels).Set(parseDurationStringToSeconds(detailedOnu.Uptime))
-				OnuLastDownDurationGauge.With(labels).Set(parseDurationStringToSeconds(detailedOnu.LastDownTimeDuration))
-				OnuLastOnlineGauge.With(labels).Set(parseTimestampStringToEpoch(detailedOnu.LastOnline))
-				OnuLastOfflineGauge.With(labels).Set(parseTimestampStringToEpoch(detailedOnu.LastOffline))
+				// Set other metrics
+				ch <- prometheus.MustNewConstMetric(OnuUptimeGaugeDesc, prometheus.GaugeValue, parseDurationStringToSeconds(detailedOnu.Uptime), detailedOnu.SerialNumber)
+				ch <- prometheus.MustNewConstMetric(OnuLastDownDurationGaugeDesc, prometheus.GaugeValue, parseDurationStringToSeconds(detailedOnu.LastDownTimeDuration), detailedOnu.SerialNumber)
+				ch <- prometheus.MustNewConstMetric(OnuLastOnlineGaugeDesc, prometheus.GaugeValue, parseTimestampStringToEpoch(detailedOnu.LastOnline), detailedOnu.SerialNumber)
+				ch <- prometheus.MustNewConstMetric(OnuLastOfflineGaugeDesc, prometheus.GaugeValue, parseTimestampStringToEpoch(detailedOnu.LastOffline), detailedOnu.SerialNumber)
 				if distance, err := strconv.ParseFloat(detailedOnu.GponOpticalDistance, 64); err == nil {
-					OnuGponOpticalDistanceGauge.With(labels).Set(distance)
+					ch <- prometheus.MustNewConstMetric(OnuGponOpticalDistanceGaugeDesc, prometheus.GaugeValue, distance, detailedOnu.SerialNumber)
 				} else {
-					log.Warn().Err(err).Msg("Could not parse GponOpticalDistance")
+					log.Warn().Err(err).Str("serial_number", detailedOnu.SerialNumber).Str("distance_str", detailedOnu.GponOpticalDistance).Msg("Could not parse GponOpticalDistance")
 				}
 			}
 		}
 	}
 	duration := time.Since(startTime)
-	log.Info().Int("processed_onus", totalOnusProcessed).Str("duration", duration.String()).Msg("Finished metric collection run")
+	log.Info().Int("processed_onus", totalOnusProcessed).Str("duration", duration.String()).Msg("Finished metric collection for scrape")
+}
+
+// --- Helper functions ---
+
+// parseDurationStringToSeconds converts a duration string like "X days Y hours Z minutes W seconds" to total seconds.
+func parseDurationStringToSeconds(durationStr string) float64 {
+	var totalSeconds int64
+	daysRegex := regexp.MustCompile(`(\d+)\s*days`)
+	hoursRegex := regexp.MustCompile(`(\d+)\s*hours`)
+	minutesRegex := regexp.MustCompile(`(\d+)\s*minutes`)
+	secondsRegex := regexp.MustCompile(`(\d+)\s*seconds`)
+
+	parseAndAddTime := func(regex *regexp.Regexp, multiplier int64) {
+		if matches := regex.FindStringSubmatch(durationStr); len(matches) > 1 {
+			value, err := strconv.ParseInt(matches[1], 10, 64)
+			if err == nil {
+				totalSeconds += value * multiplier
+			}
+		}
+	}
+
+	parseAndAddTime(daysRegex, 24*3600)
+	parseAndAddTime(hoursRegex, 3600)
+	parseAndAddTime(minutesRegex, 60)
+	parseAndAddTime(secondsRegex, 1)
+
+	return float64(totalSeconds)
+}
+
+// parseTimestampStringToEpoch converts a timestamp string (YYYY-MM-DD HH:MM:SS) to a Unix epoch.
+func parseTimestampStringToEpoch(timestampStr string) float64 {
+	timestampStr = strings.TrimSpace(timestampStr)
+	if timestampStr == "" {
+		return 0 // Return 0 for empty timestamps
+	}
+	layout := "2006-01-02 15:04:05"
+	t, err := time.Parse(layout, timestampStr)
+	if err != nil {
+		log.Warn().Err(err).Str("timestamp", timestampStr).Msg("Could not parse timestamp string")
+		return 0
+	}
+	return float64(t.Unix())
+}
+
+// mapStatusToNumeric maps the ONU status string to a numeric value.
+func mapStatusToNumeric(status string) float64 {
+	switch status {
+	case "Online":
+		return 1
+	case "Dying Gasp":
+		return 2
+	case "LOS":
+		return 3
+	case "Power-Off":
+		return 4
+	default:
+		return 0
+	}
 }
