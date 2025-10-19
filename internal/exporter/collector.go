@@ -40,6 +40,22 @@ func parseTimestampStringToEpoch(timestampStr string) float64 {
 	return float64(t.Unix())
 }
 
+// mapStatusToNumeric maps the ONU status string to a numeric value.
+func mapStatusToNumeric(status string) float64 {
+	switch status {
+	case "Online":
+		return 1
+	case "Dying Gasp":
+		return 2
+	case "LOS":
+		return 3
+	case "Power-Off":
+		return 4
+	default:
+		return 0
+	}
+}
+
 // NewOnuCollector creates a new OnuCollector.
 func NewOnuCollector(onuUsecase usecase.OnuUseCaseInterface) *OnuCollector {
 	return &OnuCollector{onuUsecase: onuUsecase}
@@ -86,7 +102,8 @@ func (c *OnuCollector) Start(ctx context.Context) {
 // collect performs a single run of the data collection.
 func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, ponMax int) {
 	// Reset gauges to remove old data to avoid reporting stale metrics.
-	OnuInfoGauge.Reset()
+	OnuMappingInfoGauge.Reset()
+	OnuStatusGauge.Reset()
 	OnuRxPowerGauge.Reset()
 	OnuTxPowerGauge.Reset()
 	OnuUptimeGauge.Reset()
@@ -120,13 +137,11 @@ func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, 
 				// --- Update Prometheus Metrics ---
 
 				labels := prometheus.Labels{
-					"board":  strconv.Itoa(detailedOnu.Board),
-					"pon":    strconv.Itoa(detailedOnu.PON),
-					"onu_id": strconv.Itoa(detailedOnu.ID),
+					"serial_number": detailedOnu.SerialNumber,
 				}
 
-				// Set ONU Info Gauge
-				infoLabels := prometheus.Labels{
+				// Set ONU Mapping Info Gauge
+				mappingLabels := prometheus.Labels{
 					"board":          strconv.Itoa(detailedOnu.Board),
 					"pon":            strconv.Itoa(detailedOnu.PON),
 					"onu_id":         strconv.Itoa(detailedOnu.ID),
@@ -134,11 +149,12 @@ func (c *OnuCollector) collect(ctx context.Context, boardMin, boardMax, ponMin, 
 					"serial_number":  detailedOnu.SerialNumber,
 					"onu_type":       detailedOnu.OnuType,
 					"description":    detailedOnu.Description,
-					"ip_address":     detailedOnu.IPAddress,
 					"offline_reason": detailedOnu.LastOfflineReason,
-					"status":         detailedOnu.Status,
 				}
-				OnuInfoGauge.With(infoLabels).Set(1)
+				OnuMappingInfoGauge.With(mappingLabels).Set(1)
+
+				// Set ONU Status Gauge
+				OnuStatusGauge.With(labels).Set(mapStatusToNumeric(detailedOnu.Status))
 
 				// Only report power metrics if the device is Online.
 				if detailedOnu.Status == "Online" {
