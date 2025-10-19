@@ -21,7 +21,7 @@ var (
 			Name: "zte_onu_mapping_info",
 			Help: "Information mapping for the ZTE ONU device.",
 		},
-		[]string{"board", "pon", "onu_id", "name", "serial_number", "onu_type", "description", "offline_reason"},
+		[]string{"board", "pon", "onu_id", "name", "serial_number", "onu_type", "description", "offline_reason", "ip_address"},
 	)
 
 	// OnuRxPowerGauge shows the received optical power of the ONU.
