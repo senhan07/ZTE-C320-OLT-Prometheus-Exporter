@@ -14,6 +14,7 @@ import (
 	"github.com/megadata-dev/go-snmp-olt-zte-c320/pkg/graceful"
 	"github.com/megadata-dev/go-snmp-olt-zte-c320/pkg/redis"
 	"github.com/megadata-dev/go-snmp-olt-zte-c320/pkg/snmp"
+	"github.com/prometheus/client_golang/prometheus"
 	rds "github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
 )
@@ -110,9 +111,9 @@ func (a *App) Start(ctx context.Context) error {
 	// Initialize handler
 	onuHandler := handler.NewOnuHandler(onuUsecase)
 
-	// Initialize and start the Prometheus collector
+	// Initialize and register the Prometheus collector
 	onuCollector := exporter.NewOnuCollector(onuUsecase)
-	onuCollector.Start(ctx)
+	prometheus.MustRegister(onuCollector)
 
 	// Initialize router
 	a.router = loadRoutes(onuHandler)
