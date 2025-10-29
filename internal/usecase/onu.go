@@ -628,8 +628,22 @@ func (u *onuUsecase) GetByBoardIDAndPonID(ctx context.Context, boardID, ponID in
 		// Check if data is already cached in Redis
 		cachedOnuData, err := u.redisRepository.GetONUInfoList(ctx, redisKey) // Get ONU Information from Redis
 		if err == nil && cachedOnuData != nil {
-			log.Info().Msg("Get ONU Information from Redis with Key: " + redisKey)
-			return cachedOnuData, nil
+			log.Info().Msg("Found ONU Information in Redis with Key: " + redisKey + ". Verifying serial numbers.")
+			// Fetch current serial numbers from device to validate cache
+			liveOnuSerials, err := u.GetOnuIDAndSerialNumber(boardID, ponID)
+			if err != nil {
+				log.Warn().Err(err).Msg("Could not fetch live serial numbers for cache validation. Proceeding with potentially stale data.")
+				return cachedOnuData, nil
+			}
+
+			// Compare serial numbers to detect changes
+			if serialsMatch(cachedOnuData, liveOnuSerials) {
+				log.Info().Msg("Cache is valid. Returning cached data.")
+				return cachedOnuData, nil
+			}
+
+			log.Info().Msg("Serial number mismatch detected. Invalidating cache and fetching fresh data.")
+			// If mismatch, fall through to SNMP walk as if it were a cache miss
 		}
 
 		// SNMP Walk to get Information from OLT Board and PON
@@ -1289,6 +1303,34 @@ func (u *onuUsecase) getLastOfflineReason(OnuLastOfflineReasonOID, onuID string)
 	}
 
 	return utils.ExtractLastOfflineReason(result.Variables[0].Value), nil
+}
+
+// serialsMatch compares the serial numbers of cached ONUs with live data to validate the cache.
+func serialsMatch(cachedData []model.ONUInfoPerBoard, liveData []model.OnuSerialNumber) bool {
+	if len(cachedData) != len(liveData) {
+		return false // Different number of ONUs means something has changed.
+	}
+
+	// Create maps for efficient lookup
+	cachedSerials := make(map[int]string)
+	for _, onu := range cachedData {
+		cachedSerials[onu.ID] = onu.SerialNumber
+	}
+
+	liveSerials := make(map[int]string)
+	for _, onu := range liveData {
+		liveSerials[onu.ID] = onu.SerialNumber
+	}
+
+	// Compare serial numbers for each ONU ID
+	for id, cachedSerial := range cachedSerials {
+		liveSerial, ok := liveSerials[id]
+		if !ok || cachedSerial != liveSerial {
+			return false // Mismatch found
+		}
+	}
+
+	return true
 }
 
 func (u *onuUsecase) getOnuGponOpticalDistance(OnuGponOpticalDistanceOID, onuID string) (string, error) {
