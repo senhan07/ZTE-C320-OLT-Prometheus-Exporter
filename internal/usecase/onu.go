@@ -31,22 +31,20 @@ type OnuUseCaseInterface interface {
 
 // onuUsecase represent the auth's usecase
 type onuUsecase struct {
-	snmpRepository  repository.SnmpRepositoryInterface
-	redisRepository repository.OnuRedisRepositoryInterface
-	cfg             *config.Config
-	sg              singleflight.Group
+	snmpRepository repository.SnmpRepositoryInterface
+	cfg            *config.Config
+	sg             singleflight.Group
 }
 
 // NewOnuUsecase will create an object that represent the auth usecase
 func NewOnuUsecase(
-	snmpRepository repository.SnmpRepositoryInterface, redisRepository repository.OnuRedisRepositoryInterface,
+	snmpRepository repository.SnmpRepositoryInterface,
 	cfg *config.Config,
 ) OnuUseCaseInterface {
 	return &onuUsecase{
-		snmpRepository:  snmpRepository,
-		redisRepository: redisRepository,
-		cfg:             cfg,
-		sg:              singleflight.Group{},
+		snmpRepository: snmpRepository,
+		cfg:            cfg,
+		sg:             singleflight.Group{},
 	}
 }
 
@@ -622,29 +620,6 @@ func (u *onuUsecase) GetByBoardIDAndPonID(ctx context.Context, boardID, ponID in
 			return nil, err
 		}
 
-		// Redis key
-		redisKey := fmt.Sprintf("board_%d_pon_%d", boardID, ponID)
-
-		// Check if data is already cached in Redis
-		cachedOnuData, err := u.redisRepository.GetONUInfoList(ctx, redisKey) // Get ONU Information from Redis
-		if err == nil && cachedOnuData != nil {
-			log.Info().Msg("Found ONU Information in Redis with Key: " + redisKey + ". Verifying serial numbers.")
-			// Fetch current serial numbers from device to validate cache
-			liveOnuSerials, err := u.GetOnuIDAndSerialNumber(boardID, ponID)
-			if err != nil {
-				log.Warn().Err(err).Msg("Could not fetch live serial numbers for cache validation. Proceeding with potentially stale data.")
-				return cachedOnuData, nil
-			}
-
-			// Compare serial numbers to detect changes
-			if serialsMatch(cachedOnuData, liveOnuSerials) {
-				log.Info().Msg("Cache is valid. Returning cached data.")
-				return cachedOnuData, nil
-			}
-
-			log.Info().Msg("Serial number mismatch detected. Invalidating cache and fetching fresh data.")
-			// If mismatch, fall through to SNMP walk as if it were a cache miss
-		}
 
 		// SNMP Walk to get Information from OLT Board and PON
 		log.Info().Msg("Get All ONU Information from SNMP Walk Board ID: " + strconv.Itoa(boardID) + " and PON ID: " + strconv.Itoa(ponID))
@@ -696,14 +671,6 @@ func (u *onuUsecase) GetByBoardIDAndPonID(ctx context.Context, boardID, ponID in
 		sort.Slice(onuInformationList, func(i, j int) bool {
 			return onuInformationList[i].ID < onuInformationList[j].ID
 		})
-
-		// Save the ONU information list to Redis with a 5-minute expiration time
-		err = u.redisRepository.SaveONUInfoList(ctx, redisKey, 300, onuInformationList)
-		if err != nil {
-			log.Error().Msg("Failed to save ONU Information to Redis: " + err.Error())
-		} else {
-			log.Info().Msg("Saved ONU Information to Redis with Key: " + redisKey)
-		}
 
 		// Return the ONU information list
 		return onuInformationList, nil
@@ -849,16 +816,6 @@ func (u *onuUsecase) GetEmptyOnuID(ctx context.Context, boardID, ponID int) ([]m
 			return nil, err
 		}
 
-		// Redis Key
-		redisKey := "board_" + strconv.Itoa(boardID) + "_pon_" + strconv.Itoa(ponID) + "_empty_onu_id"
-
-		// Try to get data from Redis using GetOnuIDCtx method with context and Redis key as parameter
-		cachedOnuData, err := u.redisRepository.GetOnuIDCtx(ctx, redisKey)
-		if err == nil && cachedOnuData != nil {
-			log.Info().Msg("Get Empty ONU ID from Redis with Key: " + redisKey)
-			// If data exists in Redis, return data from Redis
-			return cachedOnuData, nil
-		}
 
 		// Perform SNMP Walk to get ONU ID and ONU Name
 		snmpOID := oltConfig.BaseOID + oltConfig.OnuIDNameOID
@@ -906,15 +863,6 @@ func (u *onuUsecase) GetEmptyOnuID(ctx context.Context, boardID, ponID int) ([]m
 		sort.Slice(emptyOnuIDList, func(i, j int) bool {
 			return emptyOnuIDList[i].ID < emptyOnuIDList[j].ID
 		})
-
-		// Set data to Redis
-		err = u.redisRepository.SetOnuIDCtx(ctx, redisKey, 300, emptyOnuIDList)
-		if err != nil {
-			log.Error().Msg("Failed to set data to Redis: " + err.Error())
-			return nil, err
-		}
-
-		log.Info().Msg("Save Empty ONU ID to Redis with Key: " + redisKey)
 
 		return emptyOnuIDList, nil
 	})
@@ -1050,15 +998,6 @@ func (u *onuUsecase) UpdateEmptyOnuID(ctx context.Context, boardID, ponID int) e
 			return emptyOnuIDList[i].ID < emptyOnuIDList[j].ID
 		})
 
-		// Set data to Redis using SetOnuIDCtx method
-		redisKey := "board_" + strconv.Itoa(boardID) + "_pon_" + strconv.Itoa(ponID) + "_empty_onu_id"
-		err = u.redisRepository.SetOnuIDCtx(ctx, redisKey, 300, emptyOnuIDList)
-		if err != nil {
-			log.Error().Msg("Failed to set data to Redis: " + err.Error())
-			return nil, errors.New("failed to set data to Redis")
-		}
-
-		log.Info().Msg("Save Update Empty ONU ID to Redis with Key: " + redisKey)
 		return nil, nil
 	})
 

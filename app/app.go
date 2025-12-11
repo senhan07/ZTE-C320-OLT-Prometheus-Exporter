@@ -12,10 +12,8 @@ import (
 	"github.com/megadata-dev/go-snmp-olt-zte-c320/internal/usecase"
 	"github.com/megadata-dev/go-snmp-olt-zte-c320/internal/utils"
 	"github.com/megadata-dev/go-snmp-olt-zte-c320/pkg/graceful"
-	"github.com/megadata-dev/go-snmp-olt-zte-c320/pkg/redis"
 	"github.com/megadata-dev/go-snmp-olt-zte-c320/pkg/snmp"
 	"github.com/prometheus/client_golang/prometheus"
-	rds "github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
 )
 
@@ -33,7 +31,7 @@ func New() *App {
 }
 
 // Start initializes the application components, sets up connections to external services
-// (Redis and SNMP), and starts the HTTP server. It handles graceful shutdown on context
+// (SNMP), and starts the HTTP server. It handles graceful shutdown on context
 // cancellation and ensures proper cleanup of resources.
 //
 // Parameters:
@@ -51,25 +49,6 @@ func (a *App) Start(ctx context.Context) error {
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to load config")
 	}
-
-	// Initialize Redis client
-	redisClient := redis.NewRedisClient(cfg)
-
-	// Check Redis connection
-	err = redisClient.Ping(ctx).Err()
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to ping Redis server")
-	} else {
-		log.Info().Msg("Redis server successfully connected")
-	}
-
-	// Close Redis client
-	defer func(redisClient *rds.Client) {
-		err := redisClient.Close()
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to close Redis client")
-		}
-	}(redisClient)
 
 	// Initialize SNMP connection
 	snmpConn, err := snmp.SetupSnmpConnection(cfg)
@@ -103,10 +82,9 @@ func (a *App) Start(ctx context.Context) error {
 
 	// Initialize repository
 	snmpRepo := repository.NewPonRepository(snmpConn.Target, snmpConn.Community, snmpConn.Port)
-	redisRepo := repository.NewOnuRedisRepo(redisClient)
 
 	// Initialize usecase
-	onuUsecase := usecase.NewOnuUsecase(snmpRepo, redisRepo, cfg)
+	onuUsecase := usecase.NewOnuUsecase(snmpRepo, cfg)
 
 	// Initialize handler
 	onuHandler := handler.NewOnuHandler(onuUsecase)
