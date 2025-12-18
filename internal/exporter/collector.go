@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/megadata-dev/go-snmp-olt-zte-c320/internal/model"
@@ -16,11 +17,12 @@ import (
 
 // OnuCollector implements the prometheus.Collector interface.
 type OnuCollector struct {
-	onuUsecase usecase.OnuUseCaseInterface
-	boardMin   int
-	boardMax   int
-	ponMin     int
-	ponMax     int
+	onuUsecase    usecase.OnuUseCaseInterface
+	boardMin      int
+	boardMax      int
+	ponMin        int
+	ponMax        int
+	maxConcurrent int
 }
 
 // NewOnuCollector creates a new OnuCollector and configures the scan range.
@@ -30,6 +32,7 @@ func NewOnuCollector(onuUsecase usecase.OnuUseCaseInterface) *OnuCollector {
 	boardMax, _ := strconv.Atoi(os.Getenv("PROMETHEUS_BOARD_MAX"))
 	ponMin, _ := strconv.Atoi(os.Getenv("PROMETHEUS_PON_MIN"))
 	ponMax, _ := strconv.Atoi(os.Getenv("PROMETHEUS_PON_MAX"))
+	maxConcurrent, _ := strconv.Atoi(os.Getenv("PROMETHEUS_MAX_CONCURRENT"))
 
 	// Set default values if not provided.
 	if boardMin == 0 {
@@ -44,13 +47,17 @@ func NewOnuCollector(onuUsecase usecase.OnuUseCaseInterface) *OnuCollector {
 	if ponMax == 0 {
 		ponMax = 16
 	}
+	if maxConcurrent == 0 {
+		maxConcurrent = 10 // Default to 10 concurrent scrapers
+	}
 
 	return &OnuCollector{
-		onuUsecase: onuUsecase,
-		boardMin:   boardMin,
-		boardMax:   boardMax,
-		ponMin:     ponMin,
-		ponMax:     ponMax,
+		onuUsecase:    onuUsecase,
+		boardMin:      boardMin,
+		boardMax:      boardMax,
+		ponMin:        ponMin,
+		ponMax:        ponMax,
+		maxConcurrent: maxConcurrent,
 	}
 }
 
@@ -103,79 +110,101 @@ func (c *OnuCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 	log.Debug().Int("discovered", len(allDiscoveredOnus)).Int("unique", len(uniqueOnus)).Msg("Filtered ONUs by serial number")
 
+	// 3. Concurrently fetch detailed information for each unique ONU.
+	var wg sync.WaitGroup
+	jobs := make(chan model.ONUInfoPerBoard, len(uniqueOnus))
 	totalOnusProcessed := 0
-	// 3. Fetch detailed information for each unique ONU and create metrics.
-	for _, discoveredOnu := range uniqueOnus {
-		boardID := discoveredOnu.Board
-		ponID := discoveredOnu.PON
-		onuID := discoveredOnu.ID
-		detailedOnu, err := c.onuUsecase.GetByBoardIDPonIDAndOnuID(boardID, ponID, onuID)
-		if err != nil {
-			log.Warn().Err(err).Int("board", boardID).Int("pon", ponID).Int("onu_id", onuID).Msg("Failed to get detailed ONU info")
-			continue // Move to the next ONU.
-		}
 
-		totalOnusProcessed++
-
-		// --- Create and send Prometheus Metrics ---
-
-		// Set ONU Mapping Info
-		ch <- prometheus.MustNewConstMetric(
-			OnuMappingInfoGaugeDesc,
-			prometheus.GaugeValue,
-			1,
-			strconv.Itoa(detailedOnu.Board),
-			strconv.Itoa(detailedOnu.PON),
-			strconv.Itoa(detailedOnu.ID),
-			detailedOnu.Name,
-			detailedOnu.SerialNumber,
-			detailedOnu.OnuType,
-			detailedOnu.Description,
-			detailedOnu.LastOfflineReason,
-			detailedOnu.IPAddress,
-		)
-
-		// Set ONU Status
-		ch <- prometheus.MustNewConstMetric(
-			OnuStatusGaugeDesc,
-			prometheus.GaugeValue,
-			mapStatusToNumeric(detailedOnu.Status),
-			detailedOnu.SerialNumber,
-		)
-
-		// Set power metrics only if the device is Online.
-		if detailedOnu.Status == "Online" {
-			if rxPower, err := strconv.ParseFloat(detailedOnu.RXPower, 64); err == nil {
-				if rxPower < 100 { // Filter out invalid readings
-					ch <- prometheus.MustNewConstMetric(OnuRxPowerGaugeDesc, prometheus.GaugeValue, rxPower, detailedOnu.SerialNumber)
-					log.Debug().Str("serial_number", detailedOnu.SerialNumber).Float64("rx_power", rxPower).Msg("Successfully parsed and set RxPower")
+	// Start worker goroutines
+	for i := 0; i < c.maxConcurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for discoveredOnu := range jobs {
+				boardID := discoveredOnu.Board
+				ponID := discoveredOnu.PON
+				onuID := discoveredOnu.ID
+				detailedOnu, err := c.onuUsecase.GetByBoardIDPonIDAndOnuID(boardID, ponID, onuID)
+				if err != nil {
+					log.Warn().Err(err).Int("board", boardID).Int("pon", ponID).Int("onu_id", onuID).Msg("Failed to get detailed ONU info")
+					continue // Move to the next ONU.
 				}
-			} else {
-				log.Warn().Err(err).Str("serial_number", detailedOnu.SerialNumber).Str("rx_power_str", detailedOnu.RXPower).Msg("Could not parse RxPower")
+				// --- Create and send Prometheus Metrics ---
+				sendMetrics(ch, detailedOnu)
 			}
-
-			if txPower, err := strconv.ParseFloat(detailedOnu.TXPower, 64); err == nil {
-				if txPower < 100 { // Filter out invalid readings
-					ch <- prometheus.MustNewConstMetric(OnuTxPowerGaugeDesc, prometheus.GaugeValue, txPower, detailedOnu.SerialNumber)
-				}
-			} else {
-				log.Warn().Err(err).Str("serial_number", detailedOnu.SerialNumber).Str("tx_power_str", detailedOnu.TXPower).Msg("Could not parse TxPower")
-			}
-		}
-
-		// Set other metrics
-		ch <- prometheus.MustNewConstMetric(OnuUptimeGaugeDesc, prometheus.GaugeValue, parseDurationStringToSeconds(detailedOnu.Uptime), detailedOnu.SerialNumber)
-		ch <- prometheus.MustNewConstMetric(OnuLastDownDurationGaugeDesc, prometheus.GaugeValue, parseDurationStringToSeconds(detailedOnu.LastDownTimeDuration), detailedOnu.SerialNumber)
-		ch <- prometheus.MustNewConstMetric(OnuLastOnlineGaugeDesc, prometheus.GaugeValue, parseTimestampStringToEpoch(detailedOnu.LastOnline), detailedOnu.SerialNumber)
-		ch <- prometheus.MustNewConstMetric(OnuLastOfflineGaugeDesc, prometheus.GaugeValue, parseTimestampStringToEpoch(detailedOnu.LastOffline), detailedOnu.SerialNumber)
-		if distance, err := strconv.ParseFloat(detailedOnu.GponOpticalDistance, 64); err == nil {
-			ch <- prometheus.MustNewConstMetric(OnuGponOpticalDistanceGaugeDesc, prometheus.GaugeValue, distance, detailedOnu.SerialNumber)
-		} else {
-			log.Warn().Err(err).Str("serial_number", detailedOnu.SerialNumber).Str("distance_str", detailedOnu.GponOpticalDistance).Msg("Could not parse GponOpticalDistance")
-		}
+		}()
 	}
+
+	// Add jobs to the queue
+	for _, discoveredOnu := range uniqueOnus {
+		jobs <- discoveredOnu
+		totalOnusProcessed++
+	}
+	close(jobs)
+
+	// Wait for all workers to finish
+	wg.Wait()
+
 	duration := time.Since(startTime)
 	log.Info().Int("processed_onus", totalOnusProcessed).Str("duration", duration.String()).Msg("Finished metric collection for scrape")
+}
+
+// sendMetrics creates and sends Prometheus metrics for a single ONU.
+func sendMetrics(ch chan<- prometheus.Metric, detailedOnu model.ONUCustomerInfo) {
+	// Set ONU Mapping Info
+	ch <- prometheus.MustNewConstMetric(
+		OnuMappingInfoGaugeDesc,
+		prometheus.GaugeValue,
+		1,
+		strconv.Itoa(detailedOnu.Board),
+		strconv.Itoa(detailedOnu.PON),
+		strconv.Itoa(detailedOnu.ID),
+		detailedOnu.Name,
+		detailedOnu.SerialNumber,
+		detailedOnu.OnuType,
+		detailedOnu.Description,
+		detailedOnu.LastOfflineReason,
+		detailedOnu.IPAddress,
+	)
+
+	// Set ONU Status
+	ch <- prometheus.MustNewConstMetric(
+		OnuStatusGaugeDesc,
+		prometheus.GaugeValue,
+		mapStatusToNumeric(detailedOnu.Status),
+		detailedOnu.SerialNumber,
+	)
+
+	// Set power metrics only if the device is Online.
+	if detailedOnu.Status == "Online" {
+		if rxPower, err := strconv.ParseFloat(detailedOnu.RXPower, 64); err == nil {
+			if rxPower < 100 { // Filter out invalid readings
+				ch <- prometheus.MustNewConstMetric(OnuRxPowerGaugeDesc, prometheus.GaugeValue, rxPower, detailedOnu.SerialNumber)
+				log.Debug().Str("serial_number", detailedOnu.SerialNumber).Float64("rx_power", rxPower).Msg("Successfully parsed and set RxPower")
+			}
+		} else {
+			log.Warn().Err(err).Str("serial_number", detailedOnu.SerialNumber).Str("rx_power_str", detailedOnu.RXPower).Msg("Could not parse RxPower")
+		}
+
+		if txPower, err := strconv.ParseFloat(detailedOnu.TXPower, 64); err == nil {
+			if txPower < 100 { // Filter out invalid readings
+				ch <- prometheus.MustNewConstMetric(OnuTxPowerGaugeDesc, prometheus.GaugeValue, txPower, detailedOnu.SerialNumber)
+			}
+		} else {
+			log.Warn().Err(err).Str("serial_number", detailedOnu.SerialNumber).Str("tx_power_str", detailedOnu.TXPower).Msg("Could not parse TxPower")
+		}
+	}
+
+	// Set other metrics
+	ch <- prometheus.MustNewConstMetric(OnuUptimeGaugeDesc, prometheus.GaugeValue, parseDurationStringToSeconds(detailedOnu.Uptime), detailedOnu.SerialNumber)
+	ch <- prometheus.MustNewConstMetric(OnuLastDownDurationGaugeDesc, prometheus.GaugeValue, parseDurationStringToSeconds(detailedOnu.LastDownTimeDuration), detailedOnu.SerialNumber)
+	ch <- prometheus.MustNewConstMetric(OnuLastOnlineGaugeDesc, prometheus.GaugeValue, parseTimestampStringToEpoch(detailedOnu.LastOnline), detailedOnu.SerialNumber)
+	ch <- prometheus.MustNewConstMetric(OnuLastOfflineGaugeDesc, prometheus.GaugeValue, parseTimestampStringToEpoch(detailedOnu.LastOffline), detailedOnu.SerialNumber)
+	if distance, err := strconv.ParseFloat(detailedOnu.GponOpticalDistance, 64); err == nil {
+		ch <- prometheus.MustNewConstMetric(OnuGponOpticalDistanceGaugeDesc, prometheus.GaugeValue, distance, detailedOnu.SerialNumber)
+	} else {
+		log.Warn().Err(err).Str("serial_number", detailedOnu.SerialNumber).Str("distance_str", detailedOnu.GponOpticalDistance).Msg("Could not parse GponOpticalDistance")
+	}
 }
 
 // --- Helper functions ---
