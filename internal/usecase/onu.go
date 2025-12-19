@@ -636,24 +636,7 @@ func (u *onuUsecase) GetByBoardIDAndPonID(ctx context.Context, boardID, ponID in
 			Name:  utils.ExtractName(pdu.Value),
 		}
 
-		// Get Data ONU Type from SNMP Walk using getONUType method
-		if onuType, err := u.getONUType(oltConfig.OnuTypeOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.OnuType = onuType
-		}
-		// Get Data ONU Serial Number from SNMP Walk using getSerialNumber method
-		if sn, err := u.getSerialNumber(oltConfig.OnuSerialNumberOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.SerialNumber = sn
-		}
-		// Get Data ONU RX Power from SNMP Walk using getRxPower method
-		if rx, err := u.getRxPower(oltConfig.OnuRxPowerOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.RXPower = rx
-		}
-		// Get Data ONU TX Power from SNMP Walk using getTxPower method
-		if status, err := u.getStatus(oltConfig.OnuStatusOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.Status = status
-		}
-
-		// Get Data ONU IP Address from SNMP Walk using getIPAddress method
+		// The detailed information will be fetched in the Collect method.
 		onuInformationList = append(onuInformationList, onuInfo)
 	}
 
@@ -669,108 +652,105 @@ func (u *onuUsecase) GetByBoardIDAndPonID(ctx context.Context, boardID, ponID in
 func (u *onuUsecase) GetByBoardIDPonIDAndOnuID(boardID, ponID, onuID int) (
 	model.ONUCustomerInfo, error,
 ) {
-	oltConfig, err := u.getOltConfig(boardID, ponID) // Get OLT config based on Board ID and PON ID
+	oltConfig, err := u.getOltConfig(boardID, ponID)
 	if err != nil {
-		log.Error().Msg("Failed to get OLT Config: " + err.Error())
+		log.Error().Err(err).Msg("Failed to get OLT Config")
 		return model.ONUCustomerInfo{}, err
 	}
 
-	var onuInformationList model.ONUCustomerInfo   // Create a variable to store ONU information
-	snmpDataMap := make(map[string]gosnmp.SnmpPDU) // Create a map to store SNMP Walk results
+	sOnuID := strconv.Itoa(onuID)
 
-	log.Info().Msg("Get Detail ONU Information with SNMP Walk from Board ID: " +
+	// Define OIDs for a single bulk request.
+	oidName := oltConfig.BaseOID + oltConfig.OnuIDNameOID + "." + sOnuID
+	oidType := u.cfg.OltCfg.BaseOID2 + oltConfig.OnuTypeOID + "." + sOnuID
+	oidSerialNumber := oltConfig.BaseOID + oltConfig.OnuSerialNumberOID + "." + sOnuID
+	oidRxPower := oltConfig.BaseOID + oltConfig.OnuRxPowerOID + "." + sOnuID + ".1"
+	oidTxPower := u.cfg.OltCfg.BaseOID2 + oltConfig.OnuTxPowerOID + "." + sOnuID + ".1"
+	oidStatus := oltConfig.BaseOID + oltConfig.OnuStatusOID + "." + sOnuID
+	oidIPAddress := u.cfg.OltCfg.BaseOID2 + oltConfig.OnuIPAddressOID + "." + sOnuID + ".1"
+	oidDescription := oltConfig.BaseOID + oltConfig.OnuDescriptionOID + "." + sOnuID
+	oidLastOnline := oltConfig.BaseOID + oltConfig.OnuLastOnlineOID + "." + sOnuID
+	oidLastOffline := oltConfig.BaseOID + oltConfig.OnuLastOfflineOID + "." + sOnuID
+	oidLastOfflineReason := oltConfig.BaseOID + oltConfig.OnuLastOfflineReasonOID + "." + sOnuID
+	oidGponOpticalDistance := oltConfig.BaseOID + oltConfig.OnuGponOpticalDistanceOID + "." + sOnuID
+
+	oids := []string{
+		oidName, oidType, oidSerialNumber, oidRxPower, oidTxPower, oidStatus,
+		oidIPAddress, oidDescription, oidLastOnline, oidLastOffline,
+		oidLastOfflineReason, oidGponOpticalDistance,
+	}
+
+	log.Info().Msg("Get Detail ONU Information with single SNMP request from Board ID: " +
 		strconv.Itoa(boardID) + " PON ID: " + strconv.Itoa(ponID) +
 		" ONU ID: " + strconv.Itoa(onuID))
 
-	// Get ONU ID and Name using snmpRepository Walk method with timeout context parameter
-	err = u.snmpRepository.Walk(oltConfig.BaseOID+oltConfig.OnuIDNameOID+"."+strconv.Itoa(onuID),
-		func(pdu gosnmp.SnmpPDU) error {
-			snmpDataMap[utils.ExtractONUID(pdu.Name)] = pdu
-			return nil
-		})
+	result, err := u.snmpRepository.Get(oids)
 	if err != nil {
-		log.Error().Msg("Failed to walk OID: " + err.Error())
-		return model.ONUCustomerInfo{}, errors.New("failed to walk OID")
+		log.Error().Err(err).Msg("Failed to perform bulk SNMP Get for ONU details")
+		return model.ONUCustomerInfo{}, err
 	}
 
-	// Loop through SNMP data map to get ONU information based on ONU ID and ONU Name stored in map before and store
-	for _, pdu := range snmpDataMap {
-		onuInfo := model.ONUCustomerInfo{
-			Board: boardID,
-			PON:   ponID,
-			ID:    utils.ExtractIDOnuID(pdu.Name),
-			Name:  utils.ExtractName(pdu.Value),
-		}
+	onuInfo := model.ONUCustomerInfo{
+		Board: boardID,
+		PON:   ponID,
+		ID:    onuID,
+	}
 
-		// Get Data ONU Type from SNMP Walk using getONUType method
-		if onuType, err := u.getONUType(oltConfig.OnuTypeOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.OnuType = onuType
+	// Process the bulk response.
+	for _, pdu := range result.Variables {
+		switch pdu.Name {
+		case oidName:
+			onuInfo.Name = utils.ExtractName(pdu.Value)
+		case oidType:
+			onuInfo.OnuType = utils.ExtractName(pdu.Value)
+		case oidSerialNumber:
+			onuInfo.SerialNumber = utils.ExtractSerialNumber(pdu.Value)
+		case oidRxPower:
+			power, _ := utils.ConvertAndMultiply(pdu.Value)
+			onuInfo.RXPower = power
+		case oidTxPower:
+			power, _ := utils.ConvertAndMultiply(pdu.Value)
+			onuInfo.TXPower = power
+		case oidStatus:
+			onuInfo.Status = utils.ExtractAndGetStatus(pdu.Value)
+		case oidIPAddress:
+			onuInfo.IPAddress = utils.ExtractName(pdu.Value)
+		case oidDescription:
+			onuInfo.Description = utils.ExtractName(pdu.Value)
+		case oidLastOnline:
+			if pdu.Value != nil {
+				val, err := utils.ConvertByteArrayToDateTime(pdu.Value.([]byte))
+				if err == nil {
+					onuInfo.LastOnline = val
+				}
+			}
+		case oidLastOffline:
+			if pdu.Value != nil {
+				val, err := utils.ConvertByteArrayToDateTime(pdu.Value.([]byte))
+				if err == nil {
+					onuInfo.LastOffline = val
+				}
+			}
+		case oidLastOfflineReason:
+			onuInfo.LastOfflineReason = utils.ExtractLastOfflineReason(pdu.Value)
+		case oidGponOpticalDistance:
+			onuInfo.GponOpticalDistance = utils.ExtractGponOpticalDistance(pdu.Value)
 		}
+	}
 
-		// Get Data ONU Serial Number from SNMP Walk using getSerialNumber method
-		if serial, err := u.getSerialNumber(oltConfig.OnuSerialNumberOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.SerialNumber = serial
-		}
-
-		// Get Data ONU RX Power from SNMP Walk using getRxPower method
-		if rx, err := u.getRxPower(oltConfig.OnuRxPowerOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.RXPower = rx
-		}
-
-		// Get Data ONU TX Power from SNMP Walk using getTxPower method
-		if tx, err := u.getTxPower(oltConfig.OnuTxPowerOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.TXPower = tx
-		}
-
-		// Get Data ONU Status from SNMP Walk using getStatus method
-		if status, err := u.getStatus(oltConfig.OnuStatusOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.Status = status
-		}
-
-		// Get Data ONU IP Address from SNMP Walk using getIPAddress method
-		if ip, err := u.getIPAddress(oltConfig.OnuIPAddressOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.IPAddress = ip
-		}
-
-		// Get Data ONU Description from SNMP Walk using getDescription method
-		if desc, err := u.getDescription(oltConfig.OnuDescriptionOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.Description = desc
-		}
-
-		// Get Data ONU Last Online from SNMP Walk using getLastOnline method
-		if lastOnline, err := u.getLastOnline(oltConfig.OnuLastOnlineOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.LastOnline = lastOnline
-		}
-
-		// Get Data ONU Last Offline from SNMP Walk using getLastOffline method
-		if lastOffline, err := u.getLastOffline(oltConfig.OnuLastOfflineOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.LastOffline = lastOffline
-		}
-
-		// Get Data ONU Last Offline Reason from SNMP Walk using getLastOfflineReason method
+	// Calculate uptime and downtime if possible.
+	if onuInfo.LastOnline != "" {
 		if uptime, err := u.getUptimeDuration(onuInfo.LastOnline); err == nil {
 			onuInfo.Uptime = uptime
 		}
-
-		// Get Data ONU Last Downtime Duration from SNMP Walk using getLastDownDuration method
+	}
+	if onuInfo.LastOnline != "" && onuInfo.LastOffline != "" {
 		if downtime, err := u.getLastDownDuration(onuInfo.LastOffline, onuInfo.LastOnline); err == nil {
 			onuInfo.LastDownTimeDuration = downtime
 		}
-
-		// Get Data ONU Last Offline Reason from SNMP Walk using getLastOfflineReason method
-		if reason, err := u.getLastOfflineReason(oltConfig.OnuLastOfflineReasonOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.LastOfflineReason = reason
-		}
-
-		// Get Data ONU GPON Optical Distance from SNMP Walk using getOnuGponOpticalDistance method
-		if dist, err := u.getOnuGponOpticalDistance(oltConfig.OnuGponOpticalDistanceOID, strconv.Itoa(onuInfo.ID)); err == nil {
-			onuInfo.GponOpticalDistance = dist
-		}
-
-		onuInformationList = onuInfo // Append ONU information to the onuInformationList
 	}
 
-	return onuInformationList, nil // Return the ONU information list
+	return onuInfo, nil
 }
 
 func (u *onuUsecase) GetEmptyOnuID(ctx context.Context, boardID, ponID int) ([]model.OnuID, error) {
@@ -866,13 +846,13 @@ func (u *onuUsecase) GetOnuIDAndSerialNumber(boardID, ponID int) ([]model.OnuSer
 	// Loop through onuIDList to get ONU Serial Number
 	for _, onuInfo := range onuIDList {
 		// Get Data ONU Serial Number from SNMP Walk using getSerialNumber method
-		onuSerialNumber, err := u.getSerialNumber(oltConfig.OnuSerialNumberOID, strconv.Itoa(onuInfo.ID))
+		onuDetails, err := u.GetByBoardIDPonIDAndOnuID(boardID, ponID, onuInfo.ID)
 		if err == nil {
 			onuSerialNumberList = append(onuSerialNumberList, model.OnuSerialNumber{
 				Board:        boardID,
 				PON:          ponID,
 				ID:           onuInfo.ID,
-				SerialNumber: onuSerialNumber,
+				SerialNumber: onuDetails.SerialNumber,
 			})
 		}
 	}
@@ -998,37 +978,17 @@ func (u *onuUsecase) GetByBoardIDAndPonIDWithPagination(
 			ID:    onuID.ID, // Set ONU ID to ONUInfo struct ID field
 		}
 
-		// Get Name based on ONU ID and ONU Name OID and store it to ONU onuInfo struct
-		onuName, err := u.getName(oltConfig.OnuIDNameOID, strconv.Itoa(onuInfo.ID))
-		if err == nil {
-			onuInfo.Name = onuName // Set ONU Name to ONU onuInfo struct Name field
-		}
+			// Get Name based on ONU ID and ONU Name OID and store it to ONU onuInfo struct
+			onuDetails, err := u.GetByBoardIDPonIDAndOnuID(boardID, ponID, onuInfo.ID)
+			if err == nil {
+				onuInfo.Name = onuDetails.Name
+				onuInfo.OnuType = onuDetails.OnuType
+				onuInfo.SerialNumber = onuDetails.SerialNumber
+				onuInfo.RXPower = onuDetails.RXPower
+				onuInfo.Status = onuDetails.Status
+			}
 
-		// Get ONU Type based on ONU ID and ONU Type OID and store it to ONU onuInfo struct
-		onuType, err := u.getONUType(oltConfig.OnuTypeOID, strconv.Itoa(onuInfo.ID))
-		if err == nil {
-			onuInfo.OnuType = onuType // Set ONU Type to ONU onuInfo struct OnuType field
-		}
-
-		// Get ONU Serial Number based on ONU ID and ONU Serial Number OID and store it to ONU onuInfo struct
-		onuSerialNumber, err := u.getSerialNumber(oltConfig.OnuSerialNumberOID, strconv.Itoa(onuInfo.ID))
-		if err == nil {
-			onuInfo.SerialNumber = onuSerialNumber // Set ONU Serial Number to ONU onuInfo struct SerialNumber field
-		}
-
-		// Get ONU RX Power based on ONU ID and ONU RX Power OID and store it to ONU onuInfo struct
-		onuRXPower, err := u.getRxPower(oltConfig.OnuRxPowerOID, strconv.Itoa(onuInfo.ID))
-		if err == nil {
-			onuInfo.RXPower = onuRXPower // Set ONU RX Power to ONU onuInfo struct RXPower field
-		}
-
-		// Get ONU Status based on ONU ID and ONU Status OID and store it to ONU onuInfo struct
-		onuStatus, err := u.getStatus(oltConfig.OnuStatusOID, strconv.Itoa(onuInfo.ID))
-		if err == nil {
-			onuInfo.Status = onuStatus // Set ONU Status to ONU onuInfo struct Status field
-		}
-
-		// Append ONU information to the onuInformationList
+			// Append ONU information to the onuInformationList
 		onuInformationList = append(onuInformationList, onuInfo)
 	}
 
@@ -1039,133 +999,6 @@ func (u *onuUsecase) GetByBoardIDAndPonIDWithPagination(
 
 	// Return both the list and the count inside a struct
 	return onuInformationList, count
-}
-
-func (u *onuUsecase) getName(OnuIDNameOID, onuID string) (string, error) {
-	oid := u.cfg.OltCfg.BaseOID1 + OnuIDNameOID + "." + onuID
-	result, err := u.snmpRepository.Get([]string{oid})
-	if err != nil {
-		return "", err
-	}
-	return utils.ExtractName(result.Variables[0].Value), nil
-}
-
-func (u *onuUsecase) getONUType(OnuTypeOID, onuID string) (string, error) {
-	oid := u.cfg.OltCfg.BaseOID2 + OnuTypeOID + "." + onuID
-	result, err := u.snmpRepository.Get([]string{oid})
-	if err != nil {
-		return "", err
-	}
-	return utils.ExtractName(result.Variables[0].Value), nil
-}
-
-func (u *onuUsecase) getSerialNumber(OnuSerialNumberOID, onuID string) (string, error) {
-	oid := u.cfg.OltCfg.BaseOID1 + OnuSerialNumberOID + "." + onuID
-	result, err := u.snmpRepository.Get([]string{oid})
-	if err != nil {
-		return "", err
-	}
-	return utils.ExtractSerialNumber(result.Variables[0].Value), nil
-}
-
-func (u *onuUsecase) getTxPower(OnuTxPowerOID, onuID string) (string, error) {
-	oid := u.cfg.OltCfg.BaseOID2 + OnuTxPowerOID + "." + onuID + ".1"
-	result, err := u.snmpRepository.Get([]string{oid})
-	if err != nil {
-		return "", err
-	}
-	power, _ := utils.ConvertAndMultiply(result.Variables[0].Value)
-	return power, nil
-}
-
-func (u *onuUsecase) getRxPower(OnuRxPowerOID, onuID string) (string, error) {
-	oid := u.cfg.OltCfg.BaseOID1 + OnuRxPowerOID + "." + onuID + ".1"
-	result, err := u.snmpRepository.Get([]string{oid})
-	if err != nil {
-		return "", err
-	}
-	power, _ := utils.ConvertAndMultiply(result.Variables[0].Value)
-	return power, nil
-}
-
-func (u *onuUsecase) getStatus(OnuStatusOID, onuID string) (string, error) {
-	oid := u.cfg.OltCfg.BaseOID1 + OnuStatusOID + "." + onuID
-	result, err := u.snmpRepository.Get([]string{oid})
-	if err != nil {
-		return "", err
-	}
-	return utils.ExtractAndGetStatus(result.Variables[0].Value), nil
-}
-
-func (u *onuUsecase) getIPAddress(OnuIPAddressOID, onuID string) (string, error) {
-	oid := u.cfg.OltCfg.BaseOID2 + OnuIPAddressOID + "." + onuID + ".1"
-	result, err := u.snmpRepository.Get([]string{oid})
-	if err != nil {
-		return "", err
-	}
-	return utils.ExtractName(result.Variables[0].Value), nil
-}
-
-func (u *onuUsecase) getDescription(OnuDescriptionOID, onuID string) (string, error) {
-	oid := u.cfg.OltCfg.BaseOID1 + OnuDescriptionOID + "." + onuID
-	result, err := u.snmpRepository.Get([]string{oid})
-	if err != nil {
-		return "", err
-	}
-	return utils.ExtractName(result.Variables[0].Value), nil
-}
-
-func (u *onuUsecase) getLastOnline(OnuLastOnlineOID, onuID string) (string, error) {
-	oid := u.cfg.OltCfg.BaseOID1 + OnuLastOnlineOID + "." + onuID
-	result, err := u.snmpRepository.Get([]string{oid})
-	if err != nil {
-		return "", err
-	}
-
-	// Add a nil check to prevent a panic if the OLT returns an empty value.
-	if result.Variables[0].Value == nil {
-		log.Warn().Str("oid", oid).Msg("Received nil value for getLastOnline")
-		return "", nil
-	}
-
-	value := result.Variables[0].Value.([]byte)
-	return utils.ConvertByteArrayToDateTime(value)
-}
-
-func (u *onuUsecase) getLastOffline(OnuLastOfflineOID, onuID string) (string, error) {
-	baseOID := u.cfg.OltCfg.BaseOID1
-	oid := baseOID + OnuLastOfflineOID + "." + onuID
-	oids := []string{oid}
-
-	result, err := u.snmpRepository.Get(oids)
-	if err != nil {
-		log.Error().Msg("Failed to perform SNMP Get for last offline: " + err.Error())
-		return "", errors.New("failed to perform SNMP Get")
-	}
-
-	resultData := result
-	if len(resultData.Variables) > 0 {
-		// Add a nil check to prevent a panic if the OLT returns an empty value.
-		if resultData.Variables[0].Value == nil {
-			log.Warn().Str("oid", oid).Msg("Received nil value for getLastOffline")
-			return "", nil
-		}
-		value := resultData.Variables[0].Value.([]byte)
-		return utils.ConvertByteArrayToDateTime(value)
-	}
-
-	log.Error().Msg("Failed to get ONU Last Offline: No variables in the response")
-	return "", errors.New("no variables in the response")
-}
-
-func (u *onuUsecase) getLastOfflineReason(OnuLastOfflineReasonOID, onuID string) (string, error) {
-	oid := u.cfg.OltCfg.BaseOID1 + OnuLastOfflineReasonOID + "." + onuID
-	result, err := u.snmpRepository.Get([]string{oid})
-	if err != nil {
-		return "", err
-	}
-
-	return utils.ExtractLastOfflineReason(result.Variables[0].Value), nil
 }
 
 // serialsMatch compares the serial numbers of cached ONUs with live data to validate the cache.
