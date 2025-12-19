@@ -3,7 +3,6 @@ package usecase
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sort"
 	"strconv"
 	"time"
@@ -14,7 +13,6 @@ import (
 	"github.com/megadata-dev/go-snmp-olt-zte-c320/internal/repository"
 	"github.com/megadata-dev/go-snmp-olt-zte-c320/internal/utils"
 	"github.com/rs/zerolog/log"
-	"golang.org/x/sync/singleflight"
 )
 
 // OnuUseCaseInterface is an interface that represent the auth's usecase contract
@@ -33,7 +31,6 @@ type OnuUseCaseInterface interface {
 type onuUsecase struct {
 	snmpRepository repository.SnmpRepositoryInterface
 	cfg            *config.Config
-	sg             singleflight.Group
 }
 
 // NewOnuUsecase will create an object that represent the auth usecase
@@ -44,7 +41,6 @@ func NewOnuUsecase(
 	return &onuUsecase{
 		snmpRepository: snmpRepository,
 		cfg:            cfg,
-		sg:             singleflight.Group{},
 	}
 }
 
@@ -609,526 +605,445 @@ func (u *onuUsecase) getBoard2Config(ponID int) *model.OltConfig {
 func (u *onuUsecase) GetByBoardIDAndPonID(ctx context.Context, boardID, ponID int) ([]model.ONUInfoPerBoard, error) {
 	log.Info().Msg("Get All ONU Information from Board ID: " + strconv.Itoa(boardID) + " and PON ID: " + strconv.Itoa(ponID))
 
-	key := fmt.Sprintf("onuinfo-b%d-p%d", boardID, ponID)
-
-	// Using simple flight to prevent duplicate SNMP requests
-	result, err, _ := u.sg.Do(key, func() (interface{}, error) {
-		// Get OLT config
-		oltConfig, err := u.getOltConfig(boardID, ponID) // Get OLT config based on Board ID and PON ID
-		if err != nil {
-			log.Error().Msg("Failed to get OLT Config: " + err.Error())
-			return nil, err
-		}
-
-
-		// SNMP Walk to get Information from OLT Board and PON
-		log.Info().Msg("Get All ONU Information from SNMP Walk Board ID: " + strconv.Itoa(boardID) + " and PON ID: " + strconv.Itoa(ponID))
-		// Create a map to store SNMP Walk results
-		snmpDataMap := make(map[string]gosnmp.SnmpPDU)
-		// Perform SNMP Walk to get ONU ID and Name using snmpRepository Walk method with timeout context parameter
-		err = u.snmpRepository.Walk(oltConfig.BaseOID+oltConfig.OnuIDNameOID, func(pdu gosnmp.SnmpPDU) error {
-			snmpDataMap[utils.ExtractONUID(pdu.Name)] = pdu
-			return nil
-		})
-
-		if err != nil {
-			return nil, err
-		}
-
-		var onuInformationList []model.ONUInfoPerBoard // Create a slice of ONUInfoPerBoard
-
-		// Loop through SNMP data map to get ONU information based on ONU ID and ONU Name stored in map before and store
-		for _, pdu := range snmpDataMap {
-			onuInfo := model.ONUInfoPerBoard{
-				Board: boardID,
-				PON:   ponID,
-				ID:    utils.ExtractIDOnuID(pdu.Name),
-				Name:  utils.ExtractName(pdu.Value),
-			}
-
-			// Get Data ONU Type from SNMP Walk using getONUType method
-			if onuType, err := u.getONUType(oltConfig.OnuTypeOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.OnuType = onuType
-			}
-			// Get Data ONU Serial Number from SNMP Walk using getSerialNumber method
-			if sn, err := u.getSerialNumber(oltConfig.OnuSerialNumberOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.SerialNumber = sn
-			}
-			// Get Data ONU RX Power from SNMP Walk using getRxPower method
-			if rx, err := u.getRxPower(oltConfig.OnuRxPowerOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.RXPower = rx
-			}
-			// Get Data ONU TX Power from SNMP Walk using getTxPower method
-			if status, err := u.getStatus(oltConfig.OnuStatusOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.Status = status
-			}
-
-			// Get Data ONU IP Address from SNMP Walk using getIPAddress method
-			onuInformationList = append(onuInformationList, onuInfo)
-		}
-
-		// Sort the ONU information list by ID
-		sort.Slice(onuInformationList, func(i, j int) bool {
-			return onuInformationList[i].ID < onuInformationList[j].ID
-		})
-
-		// Return the ONU information list
-		return onuInformationList, nil
-	})
-
+	// Get OLT config
+	oltConfig, err := u.getOltConfig(boardID, ponID) // Get OLT config based on Board ID and PON ID
 	if err != nil {
-		log.Error().Msg("Failed to get ONU Information: " + err.Error()) // Log error message to logger
-		return nil, err                                                  // Return error if error is not nil
+		log.Error().Msg("Failed to get OLT Config: " + err.Error())
+		return nil, err
 	}
 
-	return result.([]model.ONUInfoPerBoard), nil // Return the result from the cache or SNMP Walk
+	// SNMP Walk to get Information from OLT Board and PON
+	log.Info().Msg("Get All ONU Information from SNMP Walk Board ID: " + strconv.Itoa(boardID) + " and PON ID: " + strconv.Itoa(ponID))
+	// Create a map to store SNMP Walk results
+	snmpDataMap := make(map[string]gosnmp.SnmpPDU)
+	// Perform SNMP Walk to get ONU ID and Name using snmpRepository Walk method with timeout context parameter
+	err = u.snmpRepository.Walk(oltConfig.BaseOID+oltConfig.OnuIDNameOID, func(pdu gosnmp.SnmpPDU) error {
+		snmpDataMap[utils.ExtractONUID(pdu.Name)] = pdu
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var onuInformationList []model.ONUInfoPerBoard // Create a slice of ONUInfoPerBoard
+
+	// Loop through SNMP data map to get ONU information based on ONU ID and ONU Name stored in map before and store
+	for _, pdu := range snmpDataMap {
+		onuInfo := model.ONUInfoPerBoard{
+			Board: boardID,
+			PON:   ponID,
+			ID:    utils.ExtractIDOnuID(pdu.Name),
+			Name:  utils.ExtractName(pdu.Value),
+		}
+
+		// Get Data ONU Type from SNMP Walk using getONUType method
+		if onuType, err := u.getONUType(oltConfig.OnuTypeOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.OnuType = onuType
+		}
+		// Get Data ONU Serial Number from SNMP Walk using getSerialNumber method
+		if sn, err := u.getSerialNumber(oltConfig.OnuSerialNumberOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.SerialNumber = sn
+		}
+		// Get Data ONU RX Power from SNMP Walk using getRxPower method
+		if rx, err := u.getRxPower(oltConfig.OnuRxPowerOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.RXPower = rx
+		}
+		// Get Data ONU TX Power from SNMP Walk using getTxPower method
+		if status, err := u.getStatus(oltConfig.OnuStatusOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.Status = status
+		}
+
+		// Get Data ONU IP Address from SNMP Walk using getIPAddress method
+		onuInformationList = append(onuInformationList, onuInfo)
+	}
+
+	// Sort the ONU information list by ID
+	sort.Slice(onuInformationList, func(i, j int) bool {
+		return onuInformationList[i].ID < onuInformationList[j].ID
+	})
+
+	// Return the ONU information list
+	return onuInformationList, nil
 }
 
 func (u *onuUsecase) GetByBoardIDPonIDAndOnuID(boardID, ponID, onuID int) (
 	model.ONUCustomerInfo, error,
 ) {
-	// Set key for simple flight
-	key := fmt.Sprintf("onu:%d:%d:%d", boardID, ponID, onuID)
-
-	// Using simple flight to prevent duplicate SNMP requests
-	result, err, _ := u.sg.Do(key, func() (interface{}, error) {
-		oltConfig, err := u.getOltConfig(boardID, ponID) // Get OLT config based on Board ID and PON ID
-		if err != nil {
-			log.Error().Msg("Failed to get OLT Config: " + err.Error())
-			return model.ONUCustomerInfo{}, err
-		}
-
-		var onuInformationList model.ONUCustomerInfo   // Create a variable to store ONU information
-		snmpDataMap := make(map[string]gosnmp.SnmpPDU) // Create a map to store SNMP Walk results
-
-		log.Info().Msg("Get Detail ONU Information with SNMP Walk from Board ID: " +
-			strconv.Itoa(boardID) + " PON ID: " + strconv.Itoa(ponID) +
-			" ONU ID: " + strconv.Itoa(onuID))
-
-		// Get ONU ID and Name using snmpRepository Walk method with timeout context parameter
-		err = u.snmpRepository.Walk(oltConfig.BaseOID+oltConfig.OnuIDNameOID+"."+strconv.Itoa(onuID),
-			func(pdu gosnmp.SnmpPDU) error {
-				snmpDataMap[utils.ExtractONUID(pdu.Name)] = pdu
-				return nil
-			})
-		if err != nil {
-			log.Error().Msg("Failed to walk OID: " + err.Error())
-			return model.ONUCustomerInfo{}, errors.New("failed to walk OID")
-		}
-
-		// Loop through SNMP data map to get ONU information based on ONU ID and ONU Name stored in map before and store
-		for _, pdu := range snmpDataMap {
-			onuInfo := model.ONUCustomerInfo{
-				Board: boardID,
-				PON:   ponID,
-				ID:    utils.ExtractIDOnuID(pdu.Name),
-				Name:  utils.ExtractName(pdu.Value),
-			}
-
-			// Get Data ONU Type from SNMP Walk using getONUType method
-			if onuType, err := u.getONUType(oltConfig.OnuTypeOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.OnuType = onuType
-			}
-
-			// Get Data ONU Serial Number from SNMP Walk using getSerialNumber method
-			if serial, err := u.getSerialNumber(oltConfig.OnuSerialNumberOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.SerialNumber = serial
-			}
-
-			// Get Data ONU RX Power from SNMP Walk using getRxPower method
-			if rx, err := u.getRxPower(oltConfig.OnuRxPowerOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.RXPower = rx
-			}
-
-			// Get Data ONU TX Power from SNMP Walk using getTxPower method
-			if tx, err := u.getTxPower(oltConfig.OnuTxPowerOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.TXPower = tx
-			}
-
-			// Get Data ONU Status from SNMP Walk using getStatus method
-			if status, err := u.getStatus(oltConfig.OnuStatusOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.Status = status
-			}
-
-			// Get Data ONU IP Address from SNMP Walk using getIPAddress method
-			if ip, err := u.getIPAddress(oltConfig.OnuIPAddressOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.IPAddress = ip
-			}
-
-			// Get Data ONU Description from SNMP Walk using getDescription method
-			if desc, err := u.getDescription(oltConfig.OnuDescriptionOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.Description = desc
-			}
-
-			// Get Data ONU Last Online from SNMP Walk using getLastOnline method
-			if lastOnline, err := u.getLastOnline(oltConfig.OnuLastOnlineOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.LastOnline = lastOnline
-			}
-
-			// Get Data ONU Last Offline from SNMP Walk using getLastOffline method
-			if lastOffline, err := u.getLastOffline(oltConfig.OnuLastOfflineOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.LastOffline = lastOffline
-			}
-
-			// Get Data ONU Last Offline Reason from SNMP Walk using getLastOfflineReason method
-			if uptime, err := u.getUptimeDuration(onuInfo.LastOnline); err == nil {
-				onuInfo.Uptime = uptime
-			}
-
-			// Get Data ONU Last Downtime Duration from SNMP Walk using getLastDownDuration method
-			if downtime, err := u.getLastDownDuration(onuInfo.LastOffline, onuInfo.LastOnline); err == nil {
-				onuInfo.LastDownTimeDuration = downtime
-			}
-
-			// Get Data ONU Last Offline Reason from SNMP Walk using getLastOfflineReason method
-			if reason, err := u.getLastOfflineReason(oltConfig.OnuLastOfflineReasonOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.LastOfflineReason = reason
-			}
-
-			// Get Data ONU GPON Optical Distance from SNMP Walk using getOnuGponOpticalDistance method
-			if dist, err := u.getOnuGponOpticalDistance(oltConfig.OnuGponOpticalDistanceOID, strconv.Itoa(onuInfo.ID)); err == nil {
-				onuInfo.GponOpticalDistance = dist
-			}
-
-			onuInformationList = onuInfo // Append ONU information to the onuInformationList
-		}
-
-		return onuInformationList, nil // Return the ONU information list
-	})
-
+	oltConfig, err := u.getOltConfig(boardID, ponID) // Get OLT config based on Board ID and PON ID
 	if err != nil {
+		log.Error().Msg("Failed to get OLT Config: " + err.Error())
 		return model.ONUCustomerInfo{}, err
 	}
 
-	return result.(model.ONUCustomerInfo), nil // Return the result from the cache or SNMP Walk
+	var onuInformationList model.ONUCustomerInfo   // Create a variable to store ONU information
+	snmpDataMap := make(map[string]gosnmp.SnmpPDU) // Create a map to store SNMP Walk results
+
+	log.Info().Msg("Get Detail ONU Information with SNMP Walk from Board ID: " +
+		strconv.Itoa(boardID) + " PON ID: " + strconv.Itoa(ponID) +
+		" ONU ID: " + strconv.Itoa(onuID))
+
+	// Get ONU ID and Name using snmpRepository Walk method with timeout context parameter
+	err = u.snmpRepository.Walk(oltConfig.BaseOID+oltConfig.OnuIDNameOID+"."+strconv.Itoa(onuID),
+		func(pdu gosnmp.SnmpPDU) error {
+			snmpDataMap[utils.ExtractONUID(pdu.Name)] = pdu
+			return nil
+		})
+	if err != nil {
+		log.Error().Msg("Failed to walk OID: " + err.Error())
+		return model.ONUCustomerInfo{}, errors.New("failed to walk OID")
+	}
+
+	// Loop through SNMP data map to get ONU information based on ONU ID and ONU Name stored in map before and store
+	for _, pdu := range snmpDataMap {
+		onuInfo := model.ONUCustomerInfo{
+			Board: boardID,
+			PON:   ponID,
+			ID:    utils.ExtractIDOnuID(pdu.Name),
+			Name:  utils.ExtractName(pdu.Value),
+		}
+
+		// Get Data ONU Type from SNMP Walk using getONUType method
+		if onuType, err := u.getONUType(oltConfig.OnuTypeOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.OnuType = onuType
+		}
+
+		// Get Data ONU Serial Number from SNMP Walk using getSerialNumber method
+		if serial, err := u.getSerialNumber(oltConfig.OnuSerialNumberOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.SerialNumber = serial
+		}
+
+		// Get Data ONU RX Power from SNMP Walk using getRxPower method
+		if rx, err := u.getRxPower(oltConfig.OnuRxPowerOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.RXPower = rx
+		}
+
+		// Get Data ONU TX Power from SNMP Walk using getTxPower method
+		if tx, err := u.getTxPower(oltConfig.OnuTxPowerOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.TXPower = tx
+		}
+
+		// Get Data ONU Status from SNMP Walk using getStatus method
+		if status, err := u.getStatus(oltConfig.OnuStatusOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.Status = status
+		}
+
+		// Get Data ONU IP Address from SNMP Walk using getIPAddress method
+		if ip, err := u.getIPAddress(oltConfig.OnuIPAddressOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.IPAddress = ip
+		}
+
+		// Get Data ONU Description from SNMP Walk using getDescription method
+		if desc, err := u.getDescription(oltConfig.OnuDescriptionOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.Description = desc
+		}
+
+		// Get Data ONU Last Online from SNMP Walk using getLastOnline method
+		if lastOnline, err := u.getLastOnline(oltConfig.OnuLastOnlineOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.LastOnline = lastOnline
+		}
+
+		// Get Data ONU Last Offline from SNMP Walk using getLastOffline method
+		if lastOffline, err := u.getLastOffline(oltConfig.OnuLastOfflineOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.LastOffline = lastOffline
+		}
+
+		// Get Data ONU Last Offline Reason from SNMP Walk using getLastOfflineReason method
+		if uptime, err := u.getUptimeDuration(onuInfo.LastOnline); err == nil {
+			onuInfo.Uptime = uptime
+		}
+
+		// Get Data ONU Last Downtime Duration from SNMP Walk using getLastDownDuration method
+		if downtime, err := u.getLastDownDuration(onuInfo.LastOffline, onuInfo.LastOnline); err == nil {
+			onuInfo.LastDownTimeDuration = downtime
+		}
+
+		// Get Data ONU Last Offline Reason from SNMP Walk using getLastOfflineReason method
+		if reason, err := u.getLastOfflineReason(oltConfig.OnuLastOfflineReasonOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.LastOfflineReason = reason
+		}
+
+		// Get Data ONU GPON Optical Distance from SNMP Walk using getOnuGponOpticalDistance method
+		if dist, err := u.getOnuGponOpticalDistance(oltConfig.OnuGponOpticalDistanceOID, strconv.Itoa(onuInfo.ID)); err == nil {
+			onuInfo.GponOpticalDistance = dist
+		}
+
+		onuInformationList = onuInfo // Append ONU information to the onuInformationList
+	}
+
+	return onuInformationList, nil // Return the ONU information list
 }
 
 func (u *onuUsecase) GetEmptyOnuID(ctx context.Context, boardID, ponID int) ([]model.OnuID, error) {
-	// Set key for simple flight
-	key := fmt.Sprintf("empty_onu_id:%d:%d", boardID, ponID)
+	// Get OLT config based on Board ID and PON ID
+	oltConfig, err := u.getOltConfig(boardID, ponID)
+	if err != nil {
+		log.Error().Msg("Failed to get OLT Config for Get Empty ONU ID: " + err.Error())
+		return nil, err
+	}
 
-	// Using simple flight to prevent duplicate requests for the same data
-	result, err, _ := u.sg.Do(key, func() (interface{}, error) {
-		// Get OLT config based on Board ID and PON ID
-		oltConfig, err := u.getOltConfig(boardID, ponID)
-		if err != nil {
-			log.Error().Msg("Failed to get OLT Config for Get Empty ONU ID: " + err.Error())
-			return nil, err
-		}
+	// Perform SNMP Walk to get ONU ID and ONU Name
+	snmpOID := oltConfig.BaseOID + oltConfig.OnuIDNameOID
+	emptyOnuIDList := make([]model.OnuID, 0)
 
+	log.Info().Msg("Get Empty ONU ID with SNMP Walk from Board ID: " + strconv.Itoa(boardID) + " and PON ID: " + strconv.Itoa(ponID))
 
-		// Perform SNMP Walk to get ONU ID and ONU Name
-		snmpOID := oltConfig.BaseOID + oltConfig.OnuIDNameOID
-		emptyOnuIDList := make([]model.OnuID, 0)
+	// Perform SNMP Walk to get ONU ID and Name
+	err = u.snmpRepository.Walk(snmpOID, func(pdu gosnmp.SnmpPDU) error {
+		idOnuID := utils.ExtractIDOnuID(pdu.Name)
+		emptyOnuIDList = append(emptyOnuIDList, model.OnuID{
+			Board: boardID,
+			PON:   ponID,
+			ID:    idOnuID,
+		})
+		return nil
+	})
+	if err != nil {
+		log.Error().Msg("Failed to perform SNMP Walk get empty ONU ID: " + err.Error())
+		return nil, err
+	}
 
-		log.Info().Msg("Get Empty ONU ID with SNMP Walk from Board ID: " + strconv.Itoa(boardID) + " and PON ID: " + strconv.Itoa(ponID))
+	// Create a map to store numbers to be deleted
+	numbersToRemove := make(map[int]bool)
 
-		// Perform SNMP Walk to get ONU ID and Name
-		err = u.snmpRepository.Walk(snmpOID, func(pdu gosnmp.SnmpPDU) error {
-			idOnuID := utils.ExtractIDOnuID(pdu.Name)
+	for _, onuInfo := range emptyOnuIDList {
+		numbersToRemove[onuInfo.ID] = true
+	}
+
+	// Remove the numbers that should not be added to the emptyOnuIDList
+	emptyOnuIDList = emptyOnuIDList[:0]
+
+	// Loop through 128 numbers to get the numbers to be deleted
+	for i := 1; i <= 128; i++ {
+		if _, ok := numbersToRemove[i]; !ok {
 			emptyOnuIDList = append(emptyOnuIDList, model.OnuID{
 				Board: boardID,
 				PON:   ponID,
-				ID:    idOnuID,
+				ID:    i,
 			})
-			return nil
-		})
-		if err != nil {
-			log.Error().Msg("Failed to perform SNMP Walk get empty ONU ID: " + err.Error())
-			return nil, err
 		}
-
-		// Create a map to store numbers to be deleted
-		numbersToRemove := make(map[int]bool)
-
-		for _, onuInfo := range emptyOnuIDList {
-			numbersToRemove[onuInfo.ID] = true
-		}
-
-		// Remove the numbers that should not be added to the emptyOnuIDList
-		emptyOnuIDList = emptyOnuIDList[:0]
-
-		// Loop through 128 numbers to get the numbers to be deleted
-		for i := 1; i <= 128; i++ {
-			if _, ok := numbersToRemove[i]; !ok {
-				emptyOnuIDList = append(emptyOnuIDList, model.OnuID{
-					Board: boardID,
-					PON:   ponID,
-					ID:    i,
-				})
-			}
-		}
-
-		// Sort by ID ascending
-		sort.Slice(emptyOnuIDList, func(i, j int) bool {
-			return emptyOnuIDList[i].ID < emptyOnuIDList[j].ID
-		})
-
-		return emptyOnuIDList, nil
-	})
-
-	if err != nil {
-		log.Error().Msg("Failed to get Empty ONU ID: " + err.Error()) // Log error message to logger
-		return nil, err                                               // Return error if error is not nil
 	}
 
-	return result.([]model.OnuID), nil
+	// Sort by ID ascending
+	sort.Slice(emptyOnuIDList, func(i, j int) bool {
+		return emptyOnuIDList[i].ID < emptyOnuIDList[j].ID
+	})
+
+	return emptyOnuIDList, nil
 }
 
 func (u *onuUsecase) GetOnuIDAndSerialNumber(boardID, ponID int) ([]model.OnuSerialNumber, error) {
-	// Set key for simple flight
-	key := fmt.Sprintf("onu_id_and_serial_number:%d:%d", boardID, ponID)
-
-	// Using simple flight to prevent duplicate requests for the same data
-	result, err, _ := u.sg.Do(key, func() (interface{}, error) {
-		// Get OLT config based on Board ID and PON ID
-		oltConfig, err := u.getOltConfig(boardID, ponID)
-		if err != nil {
-			log.Error().Msg("Failed to get OLT Config: " + err.Error())
-			return nil, err
-		}
-
-		// Perform SNMP Walk to get ONU ID
-		snmpOID := oltConfig.BaseOID + oltConfig.OnuIDNameOID
-		onuIDList := make([]model.OnuID, 0)
-
-		log.Info().Msg("Get ONU ID with SNMP Walk from Board ID: " + strconv.Itoa(boardID) + " and PON ID: " + strconv.Itoa(ponID))
-
-		// Perform SNMP BulkWalk to get ONU ID and Name
-		err = u.snmpRepository.Walk(snmpOID, func(pdu gosnmp.SnmpPDU) error {
-			idOnuID := utils.ExtractIDOnuID(pdu.Name)
-			onuIDList = append(onuIDList, model.OnuID{
-				Board: boardID,
-				PON:   ponID,
-				ID:    idOnuID,
-			})
-			return nil
-		})
-		if err != nil {
-			log.Error().Msg("Failed to perform SNMP Walk get ONU ID: " + err.Error())
-			return nil, err
-		}
-
-		// Create a slice of ONU Serial Number
-		var onuSerialNumberList []model.OnuSerialNumber
-
-		// Loop through onuIDList to get ONU Serial Number
-		for _, onuInfo := range onuIDList {
-			// Get Data ONU Serial Number from SNMP Walk using getSerialNumber method
-			onuSerialNumber, err := u.getSerialNumber(oltConfig.OnuSerialNumberOID, strconv.Itoa(onuInfo.ID))
-			if err == nil {
-				onuSerialNumberList = append(onuSerialNumberList, model.OnuSerialNumber{
-					Board:        boardID,
-					PON:          ponID,
-					ID:           onuInfo.ID,
-					SerialNumber: onuSerialNumber,
-				})
-			}
-		}
-
-		// Sort ONU Serial Number list based on ONU ID ascending
-		sort.Slice(onuSerialNumberList, func(i, j int) bool {
-			return onuSerialNumberList[i].ID < onuSerialNumberList[j].ID
-		})
-
-		return onuSerialNumberList, nil
-	})
-
+	// Get OLT config based on Board ID and PON ID
+	oltConfig, err := u.getOltConfig(boardID, ponID)
 	if err != nil {
-		log.Error().Msg("Failed to get ONU ID and Serial Number: " + err.Error()) // Log error message to logger
-		return nil, err                                                           // Return error if error is not nil
+		log.Error().Msg("Failed to get OLT Config: " + err.Error())
+		return nil, err
 	}
 
-	return result.([]model.OnuSerialNumber), nil
+	// Perform SNMP Walk to get ONU ID
+	snmpOID := oltConfig.BaseOID + oltConfig.OnuIDNameOID
+	onuIDList := make([]model.OnuID, 0)
+
+	log.Info().Msg("Get ONU ID with SNMP Walk from Board ID: " + strconv.Itoa(boardID) + " and PON ID: " + strconv.Itoa(ponID))
+
+	// Perform SNMP BulkWalk to get ONU ID and Name
+	err = u.snmpRepository.Walk(snmpOID, func(pdu gosnmp.SnmpPDU) error {
+		idOnuID := utils.ExtractIDOnuID(pdu.Name)
+		onuIDList = append(onuIDList, model.OnuID{
+			Board: boardID,
+			PON:   ponID,
+			ID:    idOnuID,
+		})
+		return nil
+	})
+	if err != nil {
+		log.Error().Msg("Failed to perform SNMP Walk get ONU ID: " + err.Error())
+		return nil, err
+	}
+
+	// Create a slice of ONU Serial Number
+	var onuSerialNumberList []model.OnuSerialNumber
+
+	// Loop through onuIDList to get ONU Serial Number
+	for _, onuInfo := range onuIDList {
+		// Get Data ONU Serial Number from SNMP Walk using getSerialNumber method
+		onuSerialNumber, err := u.getSerialNumber(oltConfig.OnuSerialNumberOID, strconv.Itoa(onuInfo.ID))
+		if err == nil {
+			onuSerialNumberList = append(onuSerialNumberList, model.OnuSerialNumber{
+				Board:        boardID,
+				PON:          ponID,
+				ID:           onuInfo.ID,
+				SerialNumber: onuSerialNumber,
+			})
+		}
+	}
+
+	// Sort ONU Serial Number list based on ONU ID ascending
+	sort.Slice(onuSerialNumberList, func(i, j int) bool {
+		return onuSerialNumberList[i].ID < onuSerialNumberList[j].ID
+	})
+
+	return onuSerialNumberList, nil
 }
 
 func (u *onuUsecase) UpdateEmptyOnuID(ctx context.Context, boardID, ponID int) error {
-	// Set key for simple flight
-	key := fmt.Sprintf("update_empty_onu_id:%d:%d", boardID, ponID)
+	// Get OLT config based on Board ID and PON ID
+	oltConfig, err := u.getOltConfig(boardID, ponID)
+	if err != nil {
+		log.Error().Msg("Failed to get OLT Config: " + err.Error())
+		return err
+	}
 
-	// Using simple flight to prevent duplicate requests for the same data
-	_, err, _ := u.sg.Do(key, func() (interface{}, error) {
-		// Get OLT config based on Board ID and PON ID
-		oltConfig, err := u.getOltConfig(boardID, ponID)
-		if err != nil {
-			log.Error().Msg("Failed to get OLT Config: " + err.Error())
-			return nil, err
-		}
+	// Perform SNMP Walk to get ONU ID and ONU Name
+	snmpOID := oltConfig.BaseOID + oltConfig.OnuIDNameOID
+	emptyOnuIDList := make([]model.OnuID, 0)
 
-		// Perform SNMP Walk to get ONU ID and ONU Name
-		snmpOID := oltConfig.BaseOID + oltConfig.OnuIDNameOID
-		emptyOnuIDList := make([]model.OnuID, 0)
+	log.Info().Msg("Get Empty ONU ID with SNMP Walk from Board ID: " + strconv.Itoa(boardID) + " and PON ID: " + strconv.Itoa(ponID))
 
-		log.Info().Msg("Get Empty ONU ID with SNMP Walk from Board ID: " + strconv.Itoa(boardID) + " and PON ID: " + strconv.Itoa(ponID))
+	// Perform SNMP BulkWalk to get ONU ID and Name
+	err = u.snmpRepository.Walk(snmpOID, func(pdu gosnmp.SnmpPDU) error {
+		idOnuID := utils.ExtractIDOnuID(pdu.Name)
+		emptyOnuIDList = append(emptyOnuIDList, model.OnuID{
+			Board: boardID,
+			PON:   ponID,
+			ID:    idOnuID,
+		})
+		return nil
+	})
+	if err != nil {
+		return errors.New("failed to perform SNMP Walk")
+	}
 
-		// Perform SNMP BulkWalk to get ONU ID and Name
-		err = u.snmpRepository.Walk(snmpOID, func(pdu gosnmp.SnmpPDU) error {
-			idOnuID := utils.ExtractIDOnuID(pdu.Name)
+	// Create a map to store numbers to be deleted
+	numbersToRemove := make(map[int]bool)
+	for _, onuInfo := range emptyOnuIDList {
+		numbersToRemove[onuInfo.ID] = true
+	}
+
+	// Filter out ONU IDs that are not empty
+	emptyOnuIDList = emptyOnuIDList[:0]
+	for i := 1; i <= 128; i++ {
+		if _, ok := numbersToRemove[i]; !ok {
 			emptyOnuIDList = append(emptyOnuIDList, model.OnuID{
 				Board: boardID,
 				PON:   ponID,
-				ID:    idOnuID,
+				ID:    i,
 			})
-			return nil
-		})
-		if err != nil {
-			return nil, errors.New("failed to perform SNMP Walk")
 		}
+	}
 
-		// Create a map to store numbers to be deleted
-		numbersToRemove := make(map[int]bool)
-		for _, onuInfo := range emptyOnuIDList {
-			numbersToRemove[onuInfo.ID] = true
-		}
-
-		// Filter out ONU IDs that are not empty
-		emptyOnuIDList = emptyOnuIDList[:0]
-		for i := 1; i <= 128; i++ {
-			if _, ok := numbersToRemove[i]; !ok {
-				emptyOnuIDList = append(emptyOnuIDList, model.OnuID{
-					Board: boardID,
-					PON:   ponID,
-					ID:    i,
-				})
-			}
-		}
-
-		// Sort ONU IDs by ID ascending
-		sort.Slice(emptyOnuIDList, func(i, j int) bool {
-			return emptyOnuIDList[i].ID < emptyOnuIDList[j].ID
-		})
-
-		return nil, nil
+	// Sort ONU IDs by ID ascending
+	sort.Slice(emptyOnuIDList, func(i, j int) bool {
+		return emptyOnuIDList[i].ID < emptyOnuIDList[j].ID
 	})
 
-	return err
+	return nil
 }
 
 func (u *onuUsecase) GetByBoardIDAndPonIDWithPagination(
 	boardID, ponID, pageIndex, pageSize int,
 ) ([]model.ONUInfoPerBoard, int) {
-
-	// Create a unique key for this request based on the parameters
-	key := fmt.Sprintf("get_onu_info:%d:%d:%d:%d", boardID, ponID, pageIndex, pageSize)
-
-	// Using simple flight to prevent duplicate requests for the same data
-	result, err, _ := u.sg.Do(key, func() (interface{}, error) {
-		// Get OLT config based on Board ID and PON ID
-		oltConfig, err := u.getOltConfig(boardID, ponID)
-		if err != nil {
-			return nil, err
-		}
-
-		// SNMP OID variable
-		snmpOID := oltConfig.BaseOID + oltConfig.OnuIDNameOID
-
-		var onlyOnuIDList []model.OnuOnlyID
-		var count int
-
-		// If data does not exist in Redis, then get data from SNMP
-		if len(onlyOnuIDList) == 0 {
-			err := u.snmpRepository.Walk(snmpOID, func(pdu gosnmp.SnmpPDU) error {
-				onlyOnuIDList = append(onlyOnuIDList, model.OnuOnlyID{
-					ID: utils.ExtractIDOnuID(pdu.Name),
-				})
-				return nil
-			})
-
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			// Optionally, handle Redis case here
-			log.Error().Msg("Failed to get data from Redis")
-		}
-
-		// Calculate total count
-		count = len(onlyOnuIDList)
-
-		// Calculate the index of the first item to be retrieved
-		startIndex := (pageIndex - 1) * pageSize
-
-		// Calculate the index of the last item to be retrieved
-		endIndex := startIndex + pageSize
-
-		// If the index of the last item to be retrieved is greater than the number of items, set it to the number of items
-		if endIndex > len(onlyOnuIDList) {
-			endIndex = len(onlyOnuIDList)
-		}
-
-		// Slice the data for pagination
-		onlyOnuIDList = onlyOnuIDList[startIndex:endIndex]
-
-		var onuInformationList []model.ONUInfoPerBoard
-
-		// Loop through onlyOnuIDList to get ONU information based on ONU ID
-		for _, onuID := range onlyOnuIDList {
-			onuInfo := model.ONUInfoPerBoard{
-				Board: boardID,  // Set Board ID to ONUInfo struct Board field
-				PON:   ponID,    // Set PON ID to ONUInfo struct PON field
-				ID:    onuID.ID, // Set ONU ID to ONUInfo struct ID field
-			}
-
-			// Get Name based on ONU ID and ONU Name OID and store it to ONU onuInfo struct
-			onuName, err := u.getName(oltConfig.OnuIDNameOID, strconv.Itoa(onuInfo.ID))
-			if err == nil {
-				onuInfo.Name = onuName // Set ONU Name to ONU onuInfo struct Name field
-			}
-
-			// Get ONU Type based on ONU ID and ONU Type OID and store it to ONU onuInfo struct
-			onuType, err := u.getONUType(oltConfig.OnuTypeOID, strconv.Itoa(onuInfo.ID))
-			if err == nil {
-				onuInfo.OnuType = onuType // Set ONU Type to ONU onuInfo struct OnuType field
-			}
-
-			// Get ONU Serial Number based on ONU ID and ONU Serial Number OID and store it to ONU onuInfo struct
-			onuSerialNumber, err := u.getSerialNumber(oltConfig.OnuSerialNumberOID, strconv.Itoa(onuInfo.ID))
-			if err == nil {
-				onuInfo.SerialNumber = onuSerialNumber // Set ONU Serial Number to ONU onuInfo struct SerialNumber field
-			}
-
-			// Get ONU RX Power based on ONU ID and ONU RX Power OID and store it to ONU onuInfo struct
-			onuRXPower, err := u.getRxPower(oltConfig.OnuRxPowerOID, strconv.Itoa(onuInfo.ID))
-			if err == nil {
-				onuInfo.RXPower = onuRXPower // Set ONU RX Power to ONU onuInfo struct RXPower field
-			}
-
-			// Get ONU Status based on ONU ID and ONU Status OID and store it to ONU onuInfo struct
-			onuStatus, err := u.getStatus(oltConfig.OnuStatusOID, strconv.Itoa(onuInfo.ID))
-			if err == nil {
-				onuInfo.Status = onuStatus // Set ONU Status to ONU onuInfo struct Status field
-			}
-
-			// Append ONU information to the onuInformationList
-			onuInformationList = append(onuInformationList, onuInfo)
-		}
-
-		// Sort ONU information list based on ONU ID ascending
-		sort.Slice(onuInformationList, func(i, j int) bool {
-			return onuInformationList[i].ID < onuInformationList[j].ID
-		})
-
-		// Return both the list and the count inside a struct
-		return model.PaginationResult{
-			OnuInformationList: onuInformationList,
-			Count:              count,
-		}, nil
-	})
-
-	// Handle error if any occurred during simple flight processing
+	// Get OLT config based on Board ID and PON ID
+	oltConfig, err := u.getOltConfig(boardID, ponID)
 	if err != nil {
 		return nil, 0
 	}
 
-	// Extract the result from the simple flight result and return it
-	paginationResult := result.(model.PaginationResult)
-	return paginationResult.OnuInformationList, paginationResult.Count
+	// SNMP OID variable
+	snmpOID := oltConfig.BaseOID + oltConfig.OnuIDNameOID
 
+	var onlyOnuIDList []model.OnuOnlyID
+	var count int
+
+	// If data does not exist in Redis, then get data from SNMP
+	if len(onlyOnuIDList) == 0 {
+		err := u.snmpRepository.Walk(snmpOID, func(pdu gosnmp.SnmpPDU) error {
+			onlyOnuIDList = append(onlyOnuIDList, model.OnuOnlyID{
+				ID: utils.ExtractIDOnuID(pdu.Name),
+			})
+			return nil
+		})
+
+		if err != nil {
+			return nil, 0
+		}
+	} else {
+		// Optionally, handle Redis case here
+		log.Error().Msg("Failed to get data from Redis")
+	}
+
+	// Calculate total count
+	count = len(onlyOnuIDList)
+
+	// Calculate the index of the first item to be retrieved
+	startIndex := (pageIndex - 1) * pageSize
+
+	// Calculate the index of the last item to be retrieved
+	endIndex := startIndex + pageSize
+
+	// If the index of the last item to be retrieved is greater than the number of items, set it to the number of items
+	if endIndex > len(onlyOnuIDList) {
+		endIndex = len(onlyOnuIDList)
+	}
+
+	// Slice the data for pagination
+	onlyOnuIDList = onlyOnuIDList[startIndex:endIndex]
+
+	var onuInformationList []model.ONUInfoPerBoard
+
+	// Loop through onlyOnuIDList to get ONU information based on ONU ID
+	for _, onuID := range onlyOnuIDList {
+		onuInfo := model.ONUInfoPerBoard{
+			Board: boardID,  // Set Board ID to ONUInfo struct Board field
+			PON:   ponID,    // Set PON ID to ONUInfo struct PON field
+			ID:    onuID.ID, // Set ONU ID to ONUInfo struct ID field
+		}
+
+		// Get Name based on ONU ID and ONU Name OID and store it to ONU onuInfo struct
+		onuName, err := u.getName(oltConfig.OnuIDNameOID, strconv.Itoa(onuInfo.ID))
+		if err == nil {
+			onuInfo.Name = onuName // Set ONU Name to ONU onuInfo struct Name field
+		}
+
+		// Get ONU Type based on ONU ID and ONU Type OID and store it to ONU onuInfo struct
+		onuType, err := u.getONUType(oltConfig.OnuTypeOID, strconv.Itoa(onuInfo.ID))
+		if err == nil {
+			onuInfo.OnuType = onuType // Set ONU Type to ONU onuInfo struct OnuType field
+		}
+
+		// Get ONU Serial Number based on ONU ID and ONU Serial Number OID and store it to ONU onuInfo struct
+		onuSerialNumber, err := u.getSerialNumber(oltConfig.OnuSerialNumberOID, strconv.Itoa(onuInfo.ID))
+		if err == nil {
+			onuInfo.SerialNumber = onuSerialNumber // Set ONU Serial Number to ONU onuInfo struct SerialNumber field
+		}
+
+		// Get ONU RX Power based on ONU ID and ONU RX Power OID and store it to ONU onuInfo struct
+		onuRXPower, err := u.getRxPower(oltConfig.OnuRxPowerOID, strconv.Itoa(onuInfo.ID))
+		if err == nil {
+			onuInfo.RXPower = onuRXPower // Set ONU RX Power to ONU onuInfo struct RXPower field
+		}
+
+		// Get ONU Status based on ONU ID and ONU Status OID and store it to ONU onuInfo struct
+		onuStatus, err := u.getStatus(oltConfig.OnuStatusOID, strconv.Itoa(onuInfo.ID))
+		if err == nil {
+			onuInfo.Status = onuStatus // Set ONU Status to ONU onuInfo struct Status field
+		}
+
+		// Append ONU information to the onuInformationList
+		onuInformationList = append(onuInformationList, onuInfo)
+	}
+
+	// Sort ONU information list based on ONU ID ascending
+	sort.Slice(onuInformationList, func(i, j int) bool {
+		return onuInformationList[i].ID < onuInformationList[j].ID
+	})
+
+	// Return both the list and the count inside a struct
+	return onuInformationList, count
 }
 
 func (u *onuUsecase) getName(OnuIDNameOID, onuID string) (string, error) {
 	oid := u.cfg.OltCfg.BaseOID1 + OnuIDNameOID + "." + onuID
-	result, err := u.getFromSNMPWithSingleflight(oid)
+	result, err := u.snmpRepository.Get([]string{oid})
 	if err != nil {
 		return "", err
 	}
@@ -1137,7 +1052,7 @@ func (u *onuUsecase) getName(OnuIDNameOID, onuID string) (string, error) {
 
 func (u *onuUsecase) getONUType(OnuTypeOID, onuID string) (string, error) {
 	oid := u.cfg.OltCfg.BaseOID2 + OnuTypeOID + "." + onuID
-	result, err := u.getFromSNMPWithSingleflight(oid)
+	result, err := u.snmpRepository.Get([]string{oid})
 	if err != nil {
 		return "", err
 	}
@@ -1146,7 +1061,7 @@ func (u *onuUsecase) getONUType(OnuTypeOID, onuID string) (string, error) {
 
 func (u *onuUsecase) getSerialNumber(OnuSerialNumberOID, onuID string) (string, error) {
 	oid := u.cfg.OltCfg.BaseOID1 + OnuSerialNumberOID + "." + onuID
-	result, err := u.getFromSNMPWithSingleflight(oid)
+	result, err := u.snmpRepository.Get([]string{oid})
 	if err != nil {
 		return "", err
 	}
@@ -1155,7 +1070,7 @@ func (u *onuUsecase) getSerialNumber(OnuSerialNumberOID, onuID string) (string, 
 
 func (u *onuUsecase) getTxPower(OnuTxPowerOID, onuID string) (string, error) {
 	oid := u.cfg.OltCfg.BaseOID2 + OnuTxPowerOID + "." + onuID + ".1"
-	result, err := u.getFromSNMPWithSingleflight(oid)
+	result, err := u.snmpRepository.Get([]string{oid})
 	if err != nil {
 		return "", err
 	}
@@ -1165,7 +1080,7 @@ func (u *onuUsecase) getTxPower(OnuTxPowerOID, onuID string) (string, error) {
 
 func (u *onuUsecase) getRxPower(OnuRxPowerOID, onuID string) (string, error) {
 	oid := u.cfg.OltCfg.BaseOID1 + OnuRxPowerOID + "." + onuID + ".1"
-	result, err := u.getFromSNMPWithSingleflight(oid)
+	result, err := u.snmpRepository.Get([]string{oid})
 	if err != nil {
 		return "", err
 	}
@@ -1175,7 +1090,7 @@ func (u *onuUsecase) getRxPower(OnuRxPowerOID, onuID string) (string, error) {
 
 func (u *onuUsecase) getStatus(OnuStatusOID, onuID string) (string, error) {
 	oid := u.cfg.OltCfg.BaseOID1 + OnuStatusOID + "." + onuID
-	result, err := u.getFromSNMPWithSingleflight(oid)
+	result, err := u.snmpRepository.Get([]string{oid})
 	if err != nil {
 		return "", err
 	}
@@ -1184,7 +1099,7 @@ func (u *onuUsecase) getStatus(OnuStatusOID, onuID string) (string, error) {
 
 func (u *onuUsecase) getIPAddress(OnuIPAddressOID, onuID string) (string, error) {
 	oid := u.cfg.OltCfg.BaseOID2 + OnuIPAddressOID + "." + onuID + ".1"
-	result, err := u.getFromSNMPWithSingleflight(oid)
+	result, err := u.snmpRepository.Get([]string{oid})
 	if err != nil {
 		return "", err
 	}
@@ -1193,7 +1108,7 @@ func (u *onuUsecase) getIPAddress(OnuIPAddressOID, onuID string) (string, error)
 
 func (u *onuUsecase) getDescription(OnuDescriptionOID, onuID string) (string, error) {
 	oid := u.cfg.OltCfg.BaseOID1 + OnuDescriptionOID + "." + onuID
-	result, err := u.getFromSNMPWithSingleflight(oid)
+	result, err := u.snmpRepository.Get([]string{oid})
 	if err != nil {
 		return "", err
 	}
@@ -1202,9 +1117,15 @@ func (u *onuUsecase) getDescription(OnuDescriptionOID, onuID string) (string, er
 
 func (u *onuUsecase) getLastOnline(OnuLastOnlineOID, onuID string) (string, error) {
 	oid := u.cfg.OltCfg.BaseOID1 + OnuLastOnlineOID + "." + onuID
-	result, err := u.getFromSNMPWithSingleflight(oid)
+	result, err := u.snmpRepository.Get([]string{oid})
 	if err != nil {
 		return "", err
+	}
+
+	// Add a nil check to prevent a panic if the OLT returns an empty value.
+	if result.Variables[0].Value == nil {
+		log.Warn().Str("oid", oid).Msg("Received nil value for getLastOnline")
+		return "", nil
 	}
 
 	value := result.Variables[0].Value.([]byte)
@@ -1216,16 +1137,19 @@ func (u *onuUsecase) getLastOffline(OnuLastOfflineOID, onuID string) (string, er
 	oid := baseOID + OnuLastOfflineOID + "." + onuID
 	oids := []string{oid}
 
-	result, err, _ := u.sg.Do(oid, func() (interface{}, error) {
-		return u.snmpRepository.Get(oids)
-	})
+	result, err := u.snmpRepository.Get(oids)
 	if err != nil {
 		log.Error().Msg("Failed to perform SNMP Get for last offline: " + err.Error())
 		return "", errors.New("failed to perform SNMP Get")
 	}
 
-	resultData := result.(*gosnmp.SnmpPacket)
+	resultData := result
 	if len(resultData.Variables) > 0 {
+		// Add a nil check to prevent a panic if the OLT returns an empty value.
+		if resultData.Variables[0].Value == nil {
+			log.Warn().Str("oid", oid).Msg("Received nil value for getLastOffline")
+			return "", nil
+		}
 		value := resultData.Variables[0].Value.([]byte)
 		return utils.ConvertByteArrayToDateTime(value)
 	}
@@ -1236,7 +1160,7 @@ func (u *onuUsecase) getLastOffline(OnuLastOfflineOID, onuID string) (string, er
 
 func (u *onuUsecase) getLastOfflineReason(OnuLastOfflineReasonOID, onuID string) (string, error) {
 	oid := u.cfg.OltCfg.BaseOID1 + OnuLastOfflineReasonOID + "." + onuID
-	result, err := u.getFromSNMPWithSingleflight(oid)
+	result, err := u.snmpRepository.Get([]string{oid})
 	if err != nil {
 		return "", err
 	}
@@ -1274,7 +1198,7 @@ func serialsMatch(cachedData []model.ONUInfoPerBoard, liveData []model.OnuSerial
 
 func (u *onuUsecase) getOnuGponOpticalDistance(OnuGponOpticalDistanceOID, onuID string) (string, error) {
 	oid := u.cfg.OltCfg.BaseOID1 + OnuGponOpticalDistanceOID + "." + onuID
-	result, err := u.getFromSNMPWithSingleflight(oid)
+	result, err := u.snmpRepository.Get([]string{oid})
 	if err != nil {
 		return "", err
 	}
@@ -1311,22 +1235,4 @@ func (u *onuUsecase) getLastDownDuration(lastOffline, lastOnline string) (string
 
 	duration := lastOnlineTime.Sub(lastOfflineTime)
 	return utils.ConvertDurationToString(duration), nil
-}
-
-func (u *onuUsecase) getFromSNMPWithSingleflight(oid string) (*gosnmp.SnmpPacket, error) {
-	result, err, _ := u.sg.Do(oid, func() (interface{}, error) {
-		return u.snmpRepository.Get([]string{oid})
-	})
-	if err != nil {
-		log.Error().Msg("Failed to perform SNMP Get for OID " + oid + ": " + err.Error())
-		return nil, errors.New("failed to perform SNMP Get")
-	}
-
-	packet := result.(*gosnmp.SnmpPacket)
-	if len(packet.Variables) == 0 {
-		log.Error().Msg("No variables returned for OID " + oid)
-		return nil, errors.New("no variables in the response")
-	}
-
-	return packet, nil
 }
