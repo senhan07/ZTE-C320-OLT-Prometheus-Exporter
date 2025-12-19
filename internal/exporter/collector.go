@@ -82,68 +82,67 @@ func (c *OnuCollector) Collect(ch chan<- prometheus.Metric) {
 	log.Info().Msg("Starting metric collection for Prometheus scrape")
 	startTime := time.Now()
 
-	// 1. Discover all ONUs from all configured boards and PONs.
-	var allDiscoveredOnus []model.ONUInfoPerBoard
-	for boardID := c.boardMin; boardID <= c.boardMax; boardID++ {
-		for ponID := c.ponMin; ponID <= c.ponMax; ponID++ {
-			discoveredOnus, err := c.onuUsecase.GetByBoardIDAndPonID(ctx, boardID, ponID)
-			if err != nil {
-				log.Warn().Err(err).Int("board", boardID).Int("pon", ponID).Msg("Failed to discover ONUs")
-				continue // Move to the next PON if discovery fails.
-			}
-			allDiscoveredOnus = append(allDiscoveredOnus, discoveredOnus...)
-		}
-	}
-
-	// 2. Filter out duplicate serial numbers.
-	// If duplicates are found, prioritize the one that does not have an "Other/Unknown" status.
-	uniqueOnus := make(map[string]model.ONUInfoPerBoard)
-	for _, onu := range allDiscoveredOnus {
-		if onu.SerialNumber == "" {
-			continue // Cannot process ONUs without a serial number.
-		}
-
-		existingOnu, exists := uniqueOnus[onu.SerialNumber]
-		if !exists || (mapStatusToNumeric(existingOnu.Status) == 0 && mapStatusToNumeric(onu.Status) != 0) {
-			uniqueOnus[onu.SerialNumber] = onu
-		}
-	}
-	log.Debug().Int("discovered", len(allDiscoveredOnus)).Int("unique", len(uniqueOnus)).Msg("Filtered ONUs by serial number")
-
-	// 3. Concurrently fetch detailed information for each unique ONU.
 	var wg sync.WaitGroup
-	jobs := make(chan model.ONUInfoPerBoard, len(uniqueOnus))
-	totalOnusProcessed := 0
+	uniqueOnus := sync.Map{} // Use a concurrent-safe map for unique ONUs.
+	jobs := make(chan model.ONUInfoPerBoard, 1000)
 
-	// Start worker goroutines
+	// Start the main worker pool.
 	for i := 0; i < c.maxConcurrent; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for discoveredOnu := range jobs {
-				boardID := discoveredOnu.Board
-				ponID := discoveredOnu.PON
-				onuID := discoveredOnu.ID
-				detailedOnu, err := c.onuUsecase.GetByBoardIDPonIDAndOnuID(boardID, ponID, onuID)
+				detailedOnu, err := c.onuUsecase.GetByBoardIDPonIDAndOnuID(
+					discoveredOnu.Board, discoveredOnu.PON, discoveredOnu.ID,
+				)
 				if err != nil {
-					log.Warn().Err(err).Int("board", boardID).Int("pon", ponID).Int("onu_id", onuID).Msg("Failed to get detailed ONU info")
-					continue // Move to the next ONU.
+					log.Warn().Err(err).Int("board", discoveredOnu.Board).Int("pon", discoveredOnu.PON).Int("onu_id", discoveredOnu.ID).Msg("Failed to get detailed ONU info")
+					continue
 				}
-				// --- Create and send Prometheus Metrics ---
-				sendMetrics(ch, detailedOnu)
+
+				if detailedOnu.SerialNumber == "" {
+					continue // Cannot process ONUs without a serial number.
+				}
+
+				// Filter for unique serial numbers, prioritizing non-unknown statuses.
+				if existing, exists := uniqueOnus.Load(detailedOnu.SerialNumber); exists {
+					existingOnu := existing.(model.ONUCustomerInfo)
+					if mapStatusToNumeric(existingOnu.Status) == 0 && mapStatusToNumeric(detailedOnu.Status) != 0 {
+						uniqueOnus.Store(detailedOnu.SerialNumber, detailedOnu)
+					}
+				} else {
+					uniqueOnus.Store(detailedOnu.SerialNumber, detailedOnu)
+				}
 			}
 		}()
 	}
 
-	// Add jobs to the queue
-	for _, discoveredOnu := range uniqueOnus {
-		jobs <- discoveredOnu
-		totalOnusProcessed++
+	// Discover all ONUs and feed them into the jobs channel.
+	for boardID := c.boardMin; boardID <= c.boardMax; boardID++ {
+		for ponID := c.ponMin; ponID <= c.ponMax; ponID++ {
+			discoveredOnus, err := c.onuUsecase.GetByBoardIDAndPonID(ctx, boardID, ponID)
+			if err != nil {
+				log.Warn().Err(err).Int("board", boardID).Int("pon", ponID).Msg("Failed to discover ONUs")
+				continue
+			}
+			for _, onu := range discoveredOnus {
+				jobs <- onu
+			}
+		}
 	}
 	close(jobs)
 
-	// Wait for all workers to finish
+	// Wait for all workers to finish fetching and filtering.
 	wg.Wait()
+
+	// Send metrics for the unique ONUs.
+	totalOnusProcessed := 0
+	uniqueOnus.Range(func(key, value interface{}) bool {
+		detailedOnu := value.(model.ONUCustomerInfo)
+		sendMetrics(ch, detailedOnu)
+		totalOnusProcessed++
+		return true
+	})
 
 	duration := time.Since(startTime)
 	log.Info().Int("processed_onus", totalOnusProcessed).Str("duration", duration.String()).Msg("Finished metric collection for scrape")
