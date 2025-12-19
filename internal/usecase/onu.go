@@ -637,6 +637,11 @@ func (u *onuUsecase) GetByBoardIDAndPonID(ctx context.Context, boardID, ponID in
 		}
 
 		// The detailed information will be fetched in the Collect method.
+		onuDetails, err := u.GetByBoardIDPonIDAndOnuID(boardID, ponID, onuInfo.ID)
+		if err == nil {
+			onuInfo.SerialNumber = onuDetails.SerialNumber
+			onuInfo.Status = onuDetails.Status
+		}
 		onuInformationList = append(onuInformationList, onuInfo)
 	}
 
